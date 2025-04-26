@@ -1,126 +1,254 @@
-use rand::Rng;
-use rustfft::num_traits::Zero;
-use rustfft::num_complex::{Complex, ComplexFloat};
+#![feature(portable_simd)]
+
+use std::f32::{self, consts::PI};
+use std::simd::StdFloat;
 use std::sync::Arc;
-use std::{f32::consts::PI, time::Instant};
-use rustfft::{FftPlanner, FftPlannerScalar};
-use image::{imageops, GenericImageView, GrayImage, Luma};
-use nalgebra::{ComplexField, DMatrix, DVector, RowDVector};
-use rustfft::Fft;
+use image::{GrayImage, Luma};
+use optimal_dft::get_optimal_dft_size;
+use rand::Rng;
+use rustfft::num_traits::ConstZero;
+use rustfft::{num_complex::Complex32, Fft, FftPlanner, FftPlannerNeon};
 use rayon::prelude::*;
+
+use core::simd::Simd;
+use core::simd::prelude::SimdFloat;
 mod optimal_dft;
 
-const PI2: f32 = PI * 2f32;
-const LEARNING_RATE: f32 = 0.2;
-const NORMALIZATION: f32 = 1e-5;
-const DETECTION_THRESHOLD: f32 = 5.7;
-const TRAIN_TIMES: u8 = 8;
-const WARP: f32 = 0.1;
+const LANES: usize = 4;
+type Vf = Simd<f32, LANES>;
 
-type ComplexF32 = Complex<f32>;
-type FftF32 = dyn Fft<f32>;
-
-// Represents dimensions of patch to be tracked
-// Has both top-left and centered coordinates
-
-struct BoundingBox {
-    length: usize,
-    xcenter: f32,
-    ycenter: f32,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
+pub struct Mosse {
+    h: Vec<Complex32>,
+    a: Vec<Complex32>,
+    b: Vec<Complex32>,
+    hann: Vec<f32>,
+    size: usize,
+    cx: f32,
+    cy: f32,
+    fft: Arc<dyn Fft<f32> + Sync + Send>,
+    ifft: Arc<dyn Fft<f32> + Sync + Send>,
+    scratch: Vec<Complex32>,
 }
 
-impl BoundingBox {
-    pub fn new(x: usize, y: usize, w: usize, h: usize) -> Self {
-        // Speed up FFT by finding a size breakable into small primes
-        let w = optimal_dft::get_optimal_dft_size(w);
-        let h = optimal_dft::get_optimal_dft_size(h);
+impl Mosse {
+    pub fn new(
+        planner: &mut FftPlannerNeon<f32>,
+        img: &GrayImage,
+        x: u32,
+        y: u32,
+        size: usize,
+    ) -> Self {
+        // enforce square
+        let n = get_optimal_dft_size(size);
+        let cx = (n - 1) as f32 * 0.5;
+        let cy = cx;
+
+        let fft = planner.plan_fft_forward(n);
+        let ifft = planner.plan_fft_inverse(n);
+
+        let hann = make_hann(n);
+        let gaussian = make_gaussian(n, cx, cy);
+
+        let patch0 = crop(img, x, y, n as u32, n as u32);
+
+        let mut G = to_complex(&gaussian);
+        fft2d(&*fft, n, &mut G, false);
+
+        let partials: Vec<(Vec<Complex32>, Vec<Complex32>)> =
+            (0..8).into_par_iter().map(|_| {
+                let mut p = vec![0.0; n * n];
+                random_warp(&patch0, &mut p, cx, cy, n);
+                preprocess(&mut p, &hann);
+                let mut F = to_complex(&p);
+                fft2d(&*fft, n, &mut F, false);
+                let mut Ai = vec![Complex32::ZERO; n * n];
+                let mut Bi = vec![Complex32::ZERO; n * n];
+                for idx in 0..n * n {
+                    Ai[idx] = G[idx] * F[idx].conj();
+                    Bi[idx] = F[idx] * F[idx].conj();
+                }
+                (Ai, Bi)
+            }).collect();
+
+        let mut A = vec![Complex32::ZERO; n * n];
+        let mut B = vec![Complex32::ZERO; n * n];
+        A.par_iter_mut().zip(B.par_iter_mut()).enumerate().for_each(|(i, (ai, bi))| {
+            let mut sumA = Complex32::ZERO;
+            let mut sumB = Complex32::ZERO;
+            for (Ai, Bi) in &partials {
+                sumA += Ai[i];
+                sumB += Bi[i];
+            }
+            *ai = sumA;
+            *bi = sumB;
+        });
+
+        let eps = Complex32::new(1e-5, 0.0);
+        let H = A.iter().zip(B.iter()).map(|(a,b)| *a / (*b + eps)).collect();
+        let scratch = vec![Complex32::ZERO; n * n];
+
+        Mosse { h: H, a: A, b: B, hann, size: n, cx, cy, fft, ifft, scratch }
+    }
+}
+
+#[inline]
+fn make_hann(n: usize) -> Vec<f32> {
+    // Brings 2D signal edges to zeros
+    // Thus combats Heisenberg uncertainty
+    let mut window = Vec::with_capacity(n * n);
+    let pi2 = 2f32 * f32::consts::PI;
+    let nm = (n - 1) as f32;
+
+    for i in 0..n {
+        // Optimization: compute this once per row
+        let wy = 1f32 - (pi2 * i as f32 / nm).cos(/**/);
         
-        Self { 
-            length: w * h, 
-            xcenter: w as f32 / 2f32, 
-            ycenter: h as f32 / 2f32, 
-            x, y, w, h,
+        for j in 0..n {
+            let wx = 1f32 - (pi2 * j as f32 / nm).cos(/**/);
+            window.push(wy * wx / 4f32);
+        }
+    }
+
+    window
+}
+
+#[inline]
+fn make_gaussian(n: usize, cx: f32, cy: f32) -> Vec<f32> {
+    // Constructs an "ideal response" gaussian with peak at center
+    let mut gaussian = Vec::with_capacity(n * n);
+    let sigma = 4f32;
+
+    for i in 0..n {
+        for j in 0..n {
+            let dy = i as f32 - cy;
+            let dx = j as f32 - cx;
+            let cell = -0.5 * (dx * dx + dy * dy);
+            let result = (cell / sigma).exp(/**/);
+            gaussian.push(result);
+        }
+    }
+
+    let max = gaussian.iter(/**/).cloned(/**/).fold(f32::MIN, f32::max);
+    gaussian.iter_mut(/**/).for_each(|val| { *val /= max });
+    gaussian
+}
+
+#[inline]
+fn crop(img: &GrayImage, x: u32, y: u32, w: u32, h: u32) -> Vec<f32> {
+    let patch = image::imageops::crop_imm(img, x, y, w, h).to_image(/**/);
+    patch.pixels(/**/).map(|buf| { buf[0] as f32 + 1.0 }).collect(/**/)
+}
+
+#[inline]
+fn preprocess(buf: &mut [f32], hann: &[f32]) {
+    let mut sumsq_simd = Vf::splat(0f32);
+    let mut sum_simd = Vf::splat(0f32);
+    let len = buf.len(/**/) as f32;
+
+    // Log-normalize
+    for chunk in buf.chunks_mut(LANES) {
+        let val = Vf::from_slice(chunk).ln(/**/);
+        sumsq_simd += val * val;
+        sum_simd += val;
+        
+        let arr = &val.to_array(/**/);
+        chunk.copy_from_slice(arr);
+    }
+
+    let mean = sum_simd.reduce_sum(/**/) / len;
+    let var = sumsq_simd.reduce_sum(/**/) / len - mean * mean;
+    let std_splat = Vf::splat(var.sqrt(/**/) + 1e-5);
+    let mean_splat = Vf::splat(mean);
+    let pl = buf.chunks_mut(LANES);
+    let hl = hann.chunks(LANES);
+
+    // Apply hann window
+    for (pc, hc) in pl.zip(hl) {
+        let mut val = Vf::from_slice(pc);
+        val = (val - mean_splat) / std_splat;
+        val *= Vf::from_slice(hc);
+
+        let arr = &val.to_array(/**/);
+        pc.copy_from_slice(arr);
+    }
+}
+
+#[inline]
+fn to_complex(rc: &[f32]) -> Vec<Complex32> {
+    rc.iter(/**/).map(|&val| { Complex32::new(val, 0f32) }).collect(/**/)
+}
+
+#[inline]
+fn fft2d(fft: &dyn Fft<f32>, n: usize, buf: &mut [Complex32], ifft: bool) {
+    // Applies 2D (row-wise, then column-wise) FFT/IFFT, avoids full transpose
+    let scale = if ifft { 1f32 / (n * n) as f32 } else { 1f32 };
+    buf.par_chunks_mut(n).for_each(|val| { fft.process(val) });
+
+    for j in 0..n {
+        // This factually builds a column
+        let mut col = Vec::with_capacity(n);
+
+        for i in 0..n { 
+            let cell = buf[i * n + j];
+            col.push(cell); 
+        }
+
+        fft.process(&mut col);
+
+        for i in 0..n { 
+            let cell = col[i] * scale;
+            buf[i * n + j] = cell;
         }
     }
 }
 
-struct TrackerMOSSE {
-    hann_window: DMatrix<f32>,
-    h: DMatrix<ComplexF32>,
-    a: DMatrix<ComplexF32>,
-    b: DMatrix<ComplexF32>,
-    g: DMatrix<ComplexF32>,
-    fwd_fft: Arc<FftF32>,
-    inv_fft: Arc<FftF32>,
-    tlb: BoundingBox,
-}
+#[inline]
+fn random_warp(src: &[f32], dst: &mut [f32], cx: f32, cy: f32, n: usize) {
+    // Applies random rotation + shear + scale to a given patch
+    let mut rng = rand::rng(/**/);
+    let warp = 0.1f32;
 
-impl TrackerMOSSE {
-    fn new(planner: &mut FftPlanner<f32>, tlb: BoundingBox) -> Self {
-        let hann_col = DVector::from_iterator(tlb.h, (0..tlb.h).map(|y| {
-            1.0 - (PI2 * y as f32 / (tlb.h - 1) as f32).cos(/**/) / 2f32
-        }));
+    let ang = rng.random_range(-warp..warp);
+    let c = ang.cos(/**/);
+    let s = ang.sin(/**/);
 
-        let hann_row = RowDVector::from_iterator(tlb.w, (0..tlb.w).map(|x| {
-            1.0 - (PI2 * x as f32 / (tlb.w - 1) as f32).cos(/**/) / 2f32
-        }));
-        
-        let gx = RowDVector::from_iterator(tlb.w, (0..tlb.w).map(|x| {
-            let real = -(x as f32 - tlb.xcenter).powi(2) / 2f32;
-            Complex::new(real.exp(/**/), 0f32)
-        }));
-    
-        let gy = DVector::from_iterator(tlb.h, (0..tlb.h).map(|y| {
-            let real = -(y as f32 - tlb.ycenter).powi(2) / 2f32;
-            Complex::new(real.exp(/**/), 0f32)
-        }));
-    
-        let mut gaussian = &gy * &gx;
-        let mat_template = DMatrix::zeros(tlb.h, tlb.w);
-        let fwd_fft = planner.plan_fft_forward(tlb.length);
-        let inv_fft = planner.plan_fft_inverse(tlb.length);
-        let gaussian_slice = gaussian.as_mut_slice(/**/);
-        fwd_fft.process(gaussian_slice);
+    let w00 = c + rng.random_range(-warp..warp);
+    let w01 = -s + rng.random_range(-warp..warp);
+    let w10 = s + rng.random_range(-warp..warp);
+    let w11 = c + rng.random_range(-warp..warp);
 
-        
-    
-        Self {
-            hann_window: &hann_col * &hann_row,
-            h: mat_template.clone(/**/),
-            a: mat_template.clone(/**/),
-            b: mat_template,
-            g: gaussian,
-            fwd_fft,
-            inv_fft,
-            tlb,
+    let w02 = cx - (w00 * cx + w01 * cy);
+    let w12 = cy - (w10 * cx + w11 * cy);
+
+    for i in 0..n as isize {
+        for j in 0..n as isize {
+            let u = w00 * j as f32 + w01 * i as f32 + w02;
+            let v = w10 * j as f32 + w11 * i as f32 + w12;
+            let ui = reflect(u.round(/**/) as isize, n as isize);
+            let vi = reflect(v.round(/**/) as isize, n as isize);
+            let index = (i as usize) * n + (j as usize);
+            dst[index] = src[vi * n + ui];
         }
     }
 }
 
-fn sqrt(x: f32) -> f32 {
-    let x_half = 0.5 * x;
-    let mut i = x.to_bits();
-    i = 0x5f3759df - (i >> 1);
-    let y = f32::from_bits(i);
-    y * (1.5 - x_half * y * y)
+#[inline]
+fn reflect(idx: isize, len: isize) -> usize {
+    // Same as BORDER_REFLECT in opencv
+    let mut x = idx;
+
+    while x < 0 || x >= len {
+        x = if x < 0 { -x - 1 } else { 2 * len - x - 1 };
+    }
+
+    x as usize
 }
 
 fn main() {
-    let mut planner = FftPlanner::<f32>::new(/**/);
-    let mut img = GrayImage::new(800, 800);
-    for pixel in img.pixels_mut(/**/) {
-        *pixel = Luma([128u8]);
-    }
-
-    let bbox = BoundingBox::new(80, 80, 640, 640);
-    let _ = TrackerMOSSE::new(&mut planner, bbox);
-    
-    let start = Instant::now();
-    let bbox = BoundingBox::new(80, 80, 640, 640);
-    let _ = TrackerMOSSE::new(&mut planner, bbox);
-    println!("new: {:?}", start.elapsed());
+    let mut planner = FftPlannerNeon::<f32>::new().expect("Failed to create planner");
+    let img = GrayImage::from_pixel(800,800,Luma([128]));
+    let _ = Mosse::new(&mut planner, &img, 80, 80, 375);
+    let now = std::time::Instant::now();
+    let _ = Mosse::new(&mut planner, &img, 80, 80, 375);
+    println!("initialization time: {:?}", now.elapsed());
 }
