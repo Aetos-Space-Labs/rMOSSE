@@ -6,8 +6,7 @@ use std::sync::Arc;
 use image::{GrayImage, Luma};
 use optimal_dft::get_optimal_dft_size;
 use rand::Rng;
-use rustfft::num_traits::ConstZero;
-use rustfft::{num_complex::Complex32, Fft, FftPlanner, FftPlannerNeon};
+use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 use rayon::prelude::*;
 
 use core::simd::Simd;
@@ -32,7 +31,7 @@ pub struct Mosse {
 
 impl Mosse {
     pub fn new(
-        planner: &mut FftPlannerNeon<f32>,
+        planner: &mut FftPlanner<f32>,
         img: &GrayImage,
         x: u32,
         y: u32,
@@ -245,10 +244,10 @@ fn reflect(idx: isize, len: isize) -> usize {
 }
 
 fn main() {
-    let mut planner = FftPlannerNeon::<f32>::new().expect("Failed to create planner");
+    let mut planner = FftPlanner::<f32>::new();
     let img = GrayImage::from_pixel(800,800,Luma([128]));
-    let _ = Mosse::new(&mut planner, &img, 80, 80, 375);
+    let _ = Mosse::new(&mut planner, &img, 80, 80, 640);
     let now = std::time::Instant::now();
-    let _ = Mosse::new(&mut planner, &img, 80, 80, 375);
+    let _ = Mosse::new(&mut planner, &img, 80, 80, 640);
     println!("initialization time: {:?}", now.elapsed());
 }
