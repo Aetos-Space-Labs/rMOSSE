@@ -1,20 +1,11 @@
-#![feature(portable_simd)]
-
 use std::f32::{self, consts::PI};
-use std::simd::StdFloat;
 use std::sync::Arc;
-use image::{GrayImage, Luma};
+use image::{GrayImage, Luma, imageops};
 use optimal_dft::get_optimal_dft_size;
 use rand::Rng;
 use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 use rayon::prelude::*;
-
-use core::simd::Simd;
-use core::simd::prelude::SimdFloat;
 mod optimal_dft;
-
-const LANES: usize = 4;
-type Vf = Simd<f32, LANES>;
 
 pub struct Mosse {
     h: Vec<Complex32>,
@@ -134,54 +125,51 @@ fn make_gaussian(n: usize, cx: f32, cy: f32) -> Vec<f32> {
 
 #[inline]
 fn crop(img: &GrayImage, x: u32, y: u32, w: u32, h: u32) -> Vec<f32> {
-    let patch = image::imageops::crop_imm(img, x, y, w, h).to_image(/**/);
-    patch.pixels(/**/).map(|buf| { buf[0] as f32 + 1.0 }).collect(/**/)
+    imageops::crop_imm(img, x, y, w, h).to_image(/**/).pixels(/**/).map(|luma| { 
+        luma[0] as f32 + 1f32 
+    }).collect(/**/)
 }
 
 #[inline]
 fn preprocess(buf: &mut [f32], hann: &[f32]) {
-    let mut sumsq_simd = Vf::splat(0f32);
-    let mut sum_simd = Vf::splat(0f32);
     let len = buf.len(/**/) as f32;
-
-    // Log-normalize
-    for chunk in buf.chunks_mut(LANES) {
-        let val = Vf::from_slice(chunk).ln(/**/);
-        sumsq_simd += val * val;
-        sum_simd += val;
-        
-        let arr = &val.to_array(/**/);
-        chunk.copy_from_slice(arr);
+    let mut sumsq = 0f32;
+    let mut sum = 0f32;
+    
+    for value in buf.iter_mut(/**/) {
+        *value = value.ln(/**/);
+        sumsq += *value * *value;
+        sum += *value;
     }
 
-    let mean = sum_simd.reduce_sum(/**/) / len;
-    let var = sumsq_simd.reduce_sum(/**/) / len - mean * mean;
-    let std_splat = Vf::splat(var.sqrt(/**/) + 1e-5);
-    let mean_splat = Vf::splat(mean);
-    let pl = buf.chunks_mut(LANES);
-    let hl = hann.chunks(LANES);
+    let mean = sum / len;
+    let var = sumsq / len - mean * mean;
+    let std = var.sqrt(/**/) + 1e-5;
 
-    // Apply hann window
-    for (pc, hc) in pl.zip(hl) {
-        let mut val = Vf::from_slice(pc);
-        val = (val - mean_splat) / std_splat;
-        val *= Vf::from_slice(hc);
+    let buf_iter = buf.iter_mut(/**/);
+    let hann_iter = hann.iter(/**/);
 
-        let arr = &val.to_array(/**/);
-        pc.copy_from_slice(arr);
+    // Log-normalize and apply Hann window
+    for (v, &w) in buf_iter.zip(hann_iter) {
+        *v = (*v - mean) / std * w;
     }
 }
 
 #[inline]
 fn to_complex(rc: &[f32]) -> Vec<Complex32> {
-    rc.iter(/**/).map(|&val| { Complex32::new(val, 0f32) }).collect(/**/)
+    rc.iter(/**/).map(|&val| { 
+        Complex32::new(val, 0f32) 
+    }).collect(/**/)
 }
 
 #[inline]
 fn fft2d(fft: &dyn Fft<f32>, n: usize, buf: &mut [Complex32], ifft: bool) {
     // Applies 2D (row-wise, then column-wise) FFT/IFFT, avoids full transpose
     let scale = if ifft { 1f32 / (n * n) as f32 } else { 1f32 };
-    buf.par_chunks_mut(n).for_each(|val| { fft.process(val) });
+
+    buf.par_chunks_mut(n).for_each(|val| { 
+        fft.process(val) 
+    });
 
     for j in 0..n {
         // This factually builds a column
