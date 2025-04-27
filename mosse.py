@@ -12,3 +12,8 @@ timer = time.time()
 tracker = cv2.legacy.TrackerMOSSE_create()
 tracker.init(image, bbox)
 print(time.time() - timer)
+
+timer = time.time()
+res = tracker.update(image)
+print(time.time() - timer)
+print(res)

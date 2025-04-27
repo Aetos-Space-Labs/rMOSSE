@@ -39,7 +39,7 @@ impl Mosse {
         let hann = make_hann(n);
         let gaussian = make_gaussian(n, cx, cy);
 
-        let patch0 = crop(img, x, y, n as u32, n as u32);
+        let patch0 = crop(img, x, y, n as u32);
 
         let mut G = to_complex(&gaussian);
         fft2d(&*fft, n, &mut G, false);
@@ -79,6 +79,74 @@ impl Mosse {
 
         Mosse { h: H, a: A, b: B, hann, size: n, cx, cy, fft, ifft, scratch }
     }
+
+    pub fn update(&mut self, img: &GrayImage, cx: f32, cy: f32) -> Option<(f32, f32)> {
+        // sample the patch → log-normalize & hann → FFT
+        let mut p = crop(img, cx as u32, cy as u32, self.size as u32);
+        preprocess(&mut p, &self.hann);
+        let mut F = to_complex(&p);
+        fft2d(&*self.fft, self.size, &mut F, false);
+    
+        // multiply by H in freq domain → IFFT
+        let n2 = self.size * self.size;
+        for i in 0..n2 {
+            self.scratch[i] = F[i] * self.h[i];
+        }
+        fft2d(&*self.ifft, self.size, &mut self.scratch, true);
+    
+        // compute mean, variance, find peak index
+        let mut sum = 0f32;
+        let mut sumsq = 0f32;
+        let mut maxv = f32::MIN;
+        let mut idx = 0usize;
+        for (i, c) in self.scratch.iter().enumerate() {
+            let r = c.re;
+            sum += r;
+            sumsq += r * r;
+            if r > maxv {
+                maxv = r;
+                idx = i;
+            }
+        }
+        let n2f = n2 as f32;
+        let mean = sum / n2f;
+        let var = sumsq / n2f - mean * mean;
+        let std = var.sqrt().max(1e-5);
+        let psr = (maxv - mean) / std;
+        if psr < 5.7 {
+            return None;
+        }
+    
+        // translate flat idx to (dx, dy) relative to patch center
+        let row = idx / self.size;
+        let col = idx % self.size;
+        let dy = (row as i32) - (self.size as i32 / 2);
+        let dx = (col as i32) - (self.size as i32 / 2);
+    
+        // new center
+        let ncx = cx + dx as f32;
+        let ncy = cy + dy as f32;
+    
+        // re-sample at the new center then preprocess then FFT
+        let mut p2 = crop(img, ncx as u32, ncy as u32, self.size as u32);
+        preprocess(&mut p2, &self.hann);
+        let mut F2 = to_complex(&p2);
+        fft2d(&*self.fft, self.size, &mut F2, false);
+    
+        // update A, B, and H
+        let rate = 0.2f32;
+        let eps  = Complex32::new(1e-5, 0.0);
+        for i in 0..n2 {
+            let An = self.h[i] * F2[i].conj();
+            let Bn = F2[i] * F2[i].conj();
+            self.a[i] = self.a[i] * (1.0 - rate) + An * rate;
+            self.b[i] = self.b[i] * (1.0 - rate) + Bn * rate;
+            self.h[i] = self.a[i] / (self.b[i] + eps);
+        }
+    
+        Some((ncx, ncy))
+    }
+     
 }
 
 #[inline]
@@ -124,8 +192,8 @@ fn make_gaussian(n: usize, cx: f32, cy: f32) -> Vec<f32> {
 }
 
 #[inline]
-fn crop(img: &GrayImage, x: u32, y: u32, w: u32, h: u32) -> Vec<f32> {
-    imageops::crop_imm(img, x, y, w, h).to_image(/**/).pixels(/**/).map(|luma| { 
+fn crop(img: &GrayImage, x: u32, y: u32, s: u32) -> Vec<f32> {
+    imageops::crop_imm(img, x, y, s, s).to_image(/**/).pixels(/**/).map(|luma| { 
         luma[0] as f32 + 1f32 
     }).collect(/**/)
 }
@@ -236,6 +304,11 @@ fn main() {
     let img = GrayImage::from_pixel(800,800,Luma([128]));
     let _ = Mosse::new(&mut planner, &img, 80, 80, 640);
     let now = std::time::Instant::now();
-    let _ = Mosse::new(&mut planner, &img, 80, 80, 640);
-    println!("initialization time: {:?}", now.elapsed());
+    let mut mosse = Mosse::new(&mut planner, &img, 80, 80, 640);
+    println!("init time: {:?}", now.elapsed());
+
+    let now = std::time::Instant::now();
+    let res = mosse.update(&img, 80f32, 80f32);
+    println!("update time: {:?}", now.elapsed());
+    println!("result: {:?}", res);
 }
