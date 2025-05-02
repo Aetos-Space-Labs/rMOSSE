@@ -368,17 +368,14 @@ fn warp(src: &[f32], dst: &mut [f32], cx: f32, cy: f32, n: usize) {
 #[inline]
 fn reflect(idx: isize, len: isize) -> usize {
     // Mirror‐border reflect with 101 behavior
-    let mut x = idx;
+    let mut result = idx;
 
-    while x < 0 || x >= len {
-        x = if x < 0 {
-            -x
-        } else {
-            2 * len - x
-        };
+    while result < 0 || result >= len {
+        if result < 0 { result = -result; } 
+        else { result = 2 * len - 2 - result; }
     }
     
-    x as usize
+    result as usize
 }
 
 fn main(/**/) {
