@@ -2,8 +2,6 @@ mod optimal_dft;
 
 use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 use image::{GrayImage, Luma};
-
-use optimal_dft::get_optimal_dft_size;
 use std::time::Instant;
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -100,8 +98,8 @@ struct Mosse<'a> {
 }
 
 impl<'a> Mosse<'a> {
-    pub fn new(cache: &'a mut Cache, img: &GrayImage, cx: f32, cy: f32, raw_size: usize) -> Self {
-        let size = get_optimal_dft_size(raw_size);
+    fn new(cache: &'a mut Cache, img: &GrayImage, cx: f32, cy: f32, raw_size: usize) -> Self {
+        let size = optimal_dft::get_optimal_dft_size(raw_size);
         let pre = cache.get(size);
 
         let patch = crop(img, pre, cx, cy);
@@ -155,7 +153,7 @@ impl<'a> Mosse<'a> {
         Mosse { pre, scratch, h, a, b, cx, cy }
     }
 
-    pub fn update(&mut self, img: &GrayImage) -> Option<(f32, f32)> {
+    fn update(&mut self, img: &GrayImage) -> Option<(f32, f32)> {
         let current = self.extract_and_fft(img);
     
         for i in 0..self.pre.area {
