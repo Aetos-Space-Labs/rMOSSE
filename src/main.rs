@@ -1,242 +1,234 @@
-use std::f32::{self, consts::PI};
-use std::sync::Arc;
-use image::{GrayImage, Luma, imageops};
-use optimal_dft::get_optimal_dft_size;
-use rand::Rng;
-use rustfft::{num_complex::Complex32, Fft, FftPlanner};
-use rayon::prelude::*;
 mod optimal_dft;
 
-pub struct Mosse {
-    h: Vec<Complex32>,
-    a: Vec<Complex32>,
-    b: Vec<Complex32>,
+use rustfft::{num_complex::Complex32, Fft, FftPlanner};
+use image::{GrayImage, Luma};
+
+use optimal_dft::get_optimal_dft_size;
+use std::time::Instant;
+use rayon::prelude::*;
+use std::sync::Arc;
+use rand::Rng;
+
+type VecCpx32 = Vec<Complex32>;
+type FftF32 = dyn Fft<f32>;
+
+const PSR: f32 = 5.7;
+const EPS: f32 = 1e-5;
+const WARP: f32 = 0.1;
+const LEARNRATE: f32 = 0.2;
+const EPSCPX: Complex32 = Complex32::new(EPS, 0f32);
+
+struct Precomputed {
+    fft: Arc<FftF32>,
+    ifft: Arc<FftF32>,
+    gaussian: VecCpx32,
     hann: Vec<f32>,
     size: usize,
+    area: usize,
     cx: f32,
-    cy: f32,
-    fft: Arc<dyn Fft<f32> + Sync + Send>,
-    ifft: Arc<dyn Fft<f32> + Sync + Send>,
-    scratch: Vec<Complex32>,
 }
 
-impl Mosse {
-    pub fn new(
-        planner: &mut FftPlanner<f32>,
-        img: &GrayImage,
-        x: u32,
-        y: u32,
-        size: usize,
-    ) -> Self {
-        // enforce square
-        let n = get_optimal_dft_size(size);
-        let cx = (n - 1) as f32 * 0.5;
-        let cy = cx;
+impl Precomputed {
+    fn new(planner: &mut FftPlanner<f32>, size: usize) -> Self {
+        let nm = (size - 1) as f32;
+        let area = size * size;
+        let cx = nm / 2f32;
+        let cy = nm / 2f32;
+        
+        // Hann window tapering function
+        // Combats Heisenberg uncertainty
+        let mut hann = Vec::with_capacity(area);
+        let pi2 = 2f32 * std::f32::consts::PI;
 
-        let fft = planner.plan_fft_forward(n);
-        let ifft = planner.plan_fft_inverse(n);
-
-        let hann = make_hann(n);
-        let gaussian = make_gaussian(n, cx, cy);
-
-        let patch0 = crop(img, x, y, n as u32);
-
-        let mut G = to_complex(&gaussian);
-        fft2d(&*fft, n, &mut G, false);
-
-        let partials: Vec<(Vec<Complex32>, Vec<Complex32>)> =
-            (0..8).into_par_iter().map(|_| {
-                let mut p = vec![0.0; n * n];
-                random_warp(&patch0, &mut p, cx, cy, n);
-                preprocess(&mut p, &hann);
-                let mut F = to_complex(&p);
-                fft2d(&*fft, n, &mut F, false);
-                let mut Ai = vec![Complex32::ZERO; n * n];
-                let mut Bi = vec![Complex32::ZERO; n * n];
-                for idx in 0..n * n {
-                    Ai[idx] = G[idx] * F[idx].conj();
-                    Bi[idx] = F[idx] * F[idx].conj();
-                }
-                (Ai, Bi)
-            }).collect();
-
-        let mut A = vec![Complex32::ZERO; n * n];
-        let mut B = vec![Complex32::ZERO; n * n];
-        A.par_iter_mut().zip(B.par_iter_mut()).enumerate().for_each(|(i, (ai, bi))| {
-            let mut sumA = Complex32::ZERO;
-            let mut sumB = Complex32::ZERO;
-            for (Ai, Bi) in &partials {
-                sumA += Ai[i];
-                sumB += Bi[i];
+        // Represents an ideal response
+        // Peaks at center of bounding box
+        let mut gaussian = Vec::with_capacity(area);
+        let ifft = planner.plan_fft_inverse(size);
+        let fft = planner.plan_fft_forward(size);
+        
+        for i in 0..size {
+            // Optimization: compute this once per row
+            let wy = 1f32 - (pi2 * i as f32 / nm).cos(/**/);
+            let dy = i as f32 - cy;
+            
+            for j in 0..size {
+                let dx = j as f32 - cx;
+                let result = (-0.5 * (dx * dx + dy * dy) / 4f32).exp(/**/);
+                let wx = 1f32 - (pi2 * j as f32 / nm).cos(/**/);
+                hann.push(wy * wx / 4f32);
+                gaussian.push(result);
             }
-            *ai = sumA;
-            *bi = sumB;
+        }
+
+        let max = gaussian.iter(/**/).cloned(/**/).fold(f32::MIN, f32::max);
+        gaussian.iter_mut(/**/).for_each(|value| *value /= max);
+
+        let mut gaussian = to_complex(&gaussian, 0f32);
+        fft2dd(&mut gaussian, &fft, 1f32, size);
+
+        Precomputed { fft, ifft, gaussian, hann, size, area, cx }
+    }
+}
+
+struct Cache {
+    planner: FftPlanner<f32>,
+    cache: Vec<Precomputed>,
+}
+
+impl Cache {
+    fn get(&mut self, size: usize) -> &Precomputed {
+        if let Some(idx) = self.cache.iter(/**/).position(|pre| pre.size == size) {
+            // Internally we only do square bounding boxes to simplify things
+            // Among other perks this allows for simple caching mechanism
+            return &self.cache[idx];
+        }
+        
+        let fresh_precomputed = Precomputed::new(&mut self.planner, size);
+        self.cache.push(fresh_precomputed);
+        self.cache.last(/**/).unwrap(/**/)
+    }
+}
+
+struct Mosse<'a> {
+    pre: &'a Precomputed,
+    scratch: VecCpx32,
+    h: VecCpx32,
+    a: VecCpx32,
+    b: VecCpx32,
+    cx: f32,
+    cy: f32,
+}
+
+impl<'a> Mosse<'a> {
+    pub fn new(cache: &'a mut Cache, img: &GrayImage, cx: f32, cy: f32, raw_size: usize) -> Self {
+        let size = get_optimal_dft_size(raw_size);
+        let pre = cache.get(size);
+
+        let patch = crop(img, pre, cx, cy);
+        let parts: Vec<(VecCpx32, VecCpx32)> =
+            (0..8).into_par_iter(/**/).map(|_| {
+                let mut target = vec![0f32; pre.area];
+                warp(&patch, &mut target, pre.cx, pre.cx, size);
+                preprocess(&mut target, &pre.hann, 0f32);
+
+                let mut target = to_complex(&target, 0f32);
+                fft2d(&mut target, pre, false);
+
+                let mut apass = vec![Complex32::ZERO; pre.area];
+                let mut bpass = vec![Complex32::ZERO; pre.area];
+
+                for idx in 0..pre.area {
+                    apass[idx] = pre.gaussian[idx] * target[idx].conj(/**/);
+                    bpass[idx] = target[idx] * target[idx].conj(/**/);
+                }
+
+                (apass, bpass)
+            }).collect(/**/);
+
+        let mut a = vec![Complex32::ZERO; pre.area];
+        let mut b = vec![Complex32::ZERO; pre.area];
+        let aiter = a.par_iter_mut(/**/);
+        let biter = b.par_iter_mut(/**/);
+
+        aiter.zip(biter).enumerate(/**/).for_each(|(i, ab)| {
+            let mut asum = Complex32::ZERO;
+            let mut bsum = Complex32::ZERO;
+            
+            for (ai, bi) in &parts {
+                asum += ai[i];
+                bsum += bi[i];
+            }
+
+            *ab.0 = asum;
+            *ab.1 = bsum;
         });
 
-        let eps = Complex32::new(1e-5, 0.0);
-        let H = A.iter().zip(B.iter()).map(|(a,b)| *a / (*b + eps)).collect();
-        let scratch = vec![Complex32::ZERO; n * n];
+        let aiter = a.iter(/**/);
+        let biter = b.iter(/**/);
 
-        Mosse { h: H, a: A, b: B, hann, size: n, cx, cy, fft, ifft, scratch }
+        let h = aiter.zip(biter).map(|(a, b)| {
+            // Build an actual correlation filter
+            *a / (*b + EPSCPX)
+        }).collect(/**/);
+        
+        let scratch = vec![Complex32::ZERO; pre.area];
+        Mosse { pre, scratch, h, a, b, cx, cy }
     }
 
-    pub fn update(&mut self, img: &GrayImage, cx: f32, cy: f32) -> Option<(f32, f32)> {
-        // sample the patch → log-normalize & hann → FFT
-        let mut p = crop(img, cx as u32, cy as u32, self.size as u32);
-        preprocess(&mut p, &self.hann);
-        let mut F = to_complex(&p);
-        fft2d(&*self.fft, self.size, &mut F, false);
+    pub fn update(&mut self, img: &GrayImage) -> Option<(f32, f32)> {
+        let current = self.extract_and_fft(img);
     
-        // multiply by H in freq domain → IFFT
-        let n2 = self.size * self.size;
-        for i in 0..n2 {
-            self.scratch[i] = F[i] * self.h[i];
+        for i in 0..self.pre.area {
+            let filter = self.h[i].conj(/**/);
+            self.scratch[i] = current[i] * filter;
         }
-        fft2d(&*self.ifft, self.size, &mut self.scratch, true);
+
+        fft2d(&mut self.scratch, self.pre, true);
     
-        // compute mean, variance, find peak index
         let mut sum = 0f32;
         let mut sumsq = 0f32;
         let mut maxv = f32::MIN;
-        let mut idx = 0usize;
-        for (i, c) in self.scratch.iter().enumerate() {
-            let r = c.re;
-            sum += r;
-            sumsq += r * r;
-            if r > maxv {
-                maxv = r;
+        let mut idx = 0;
+
+        for (i, c) in self.scratch.iter(/**/).enumerate(/**/) {
+            // Compute peak-to-sidelobe ratio in frequency domain
+            sumsq += c.re * c.re;
+            sum += c.re;
+
+            if c.re > maxv {
+                maxv = c.re;
                 idx = i;
             }
         }
-        let n2f = n2 as f32;
-        let mean = sum / n2f;
-        let var = sumsq / n2f - mean * mean;
-        let std = var.sqrt().max(1e-5);
-        let psr = (maxv - mean) / std;
-        if psr < 5.7 {
+
+        let mean = sum / self.pre.area as f32;
+        let var = sumsq / self.pre.area as f32 - mean * mean;
+        if (maxv - mean) / var.sqrt(/**/).max(EPS) < PSR {
             return None;
         }
     
-        // translate flat idx to (dx, dy) relative to patch center
-        let row = idx / self.size;
-        let col = idx % self.size;
-        let dy = (row as i32) - (self.size as i32 / 2);
-        let dx = (col as i32) - (self.size as i32 / 2);
-    
-        // new center
-        let ncx = cx + dx as f32;
-        let ncy = cy + dy as f32;
-    
-        // re-sample at the new center then preprocess then FFT
-        let mut p2 = crop(img, ncx as u32, ncy as u32, self.size as u32);
-        preprocess(&mut p2, &self.hann);
-        let mut F2 = to_complex(&p2);
-        fft2d(&*self.fft, self.size, &mut F2, false);
-    
-        // update A, B, and H
-        let rate = 0.2f32;
-        let eps  = Complex32::new(1e-5, 0.0);
-        for i in 0..n2 {
-            let An = self.h[i] * F2[i].conj();
-            let Bn = F2[i] * F2[i].conj();
-            self.a[i] = self.a[i] * (1.0 - rate) + An * rate;
-            self.b[i] = self.b[i] * (1.0 - rate) + Bn * rate;
-            self.h[i] = self.a[i] / (self.b[i] + eps);
-        }
-    
-        Some((ncx, ncy))
-    }
-     
-}
-
-#[inline]
-fn make_hann(n: usize) -> Vec<f32> {
-    // Brings 2D signal edges to zeros
-    // Thus combats Heisenberg uncertainty
-    let mut window = Vec::with_capacity(n * n);
-    let pi2 = 2f32 * f32::consts::PI;
-    let nm = (n - 1) as f32;
-
-    for i in 0..n {
-        // Optimization: compute this once per row
-        let wy = 1f32 - (pi2 * i as f32 / nm).cos(/**/);
+        let row = idx / self.pre.size;
+        let col = idx % self.pre.size;
+        self.cx += col as f32 - (self.pre.size as f32 / 2f32);
+        self.cy += row as f32 - (self.pre.size as f32 / 2f32);
         
-        for j in 0..n {
-            let wx = 1f32 - (pi2 * j as f32 / nm).cos(/**/);
-            window.push(wy * wx / 4f32);
+        let result = (self.cx, self.cy);
+        let next = self.extract_and_fft(img);
+
+        for i in 0..self.pre.area {
+            let an = self.h[i] * next[i].conj(/**/) * LEARNRATE;
+            let bn = next[i] * next[i].conj(/**/) * LEARNRATE;
+            self.a[i] = self.a[i] * (1f32 - LEARNRATE) + an;
+            self.b[i] = self.b[i] * (1f32 - LEARNRATE) + bn;
+            self.h[i] = self.a[i] / (self.b[i] + EPSCPX);
         }
+        
+        Some(result)
     }
 
-    window
-}
+    #[inline]
+    fn extract_and_fft(&self, img: &GrayImage) -> VecCpx32 {
+        let mut buf = crop(img, self.pre, self.cx, self.cy);
+        preprocess(&mut buf, &self.pre.hann, 0f32);
 
-#[inline]
-fn make_gaussian(n: usize, cx: f32, cy: f32) -> Vec<f32> {
-    // Constructs an "ideal response" gaussian with peak at center
-    let mut gaussian = Vec::with_capacity(n * n);
-    let sigma = 4f32;
-
-    for i in 0..n {
-        for j in 0..n {
-            let dy = i as f32 - cy;
-            let dx = j as f32 - cx;
-            let cell = -0.5 * (dx * dx + dy * dy);
-            let result = (cell / sigma).exp(/**/);
-            gaussian.push(result);
-        }
-    }
-
-    let max = gaussian.iter(/**/).cloned(/**/).fold(f32::MIN, f32::max);
-    gaussian.iter_mut(/**/).for_each(|val| { *val /= max });
-    gaussian
-}
-
-#[inline]
-fn crop(img: &GrayImage, x: u32, y: u32, s: u32) -> Vec<f32> {
-    imageops::crop_imm(img, x, y, s, s).to_image(/**/).pixels(/**/).map(|luma| { 
-        luma[0] as f32 + 1f32 
-    }).collect(/**/)
-}
-
-#[inline]
-fn preprocess(buf: &mut [f32], hann: &[f32]) {
-    let len = buf.len(/**/) as f32;
-    let mut sumsq = 0f32;
-    let mut sum = 0f32;
-    
-    for value in buf.iter_mut(/**/) {
-        *value = value.ln(/**/);
-        sumsq += *value * *value;
-        sum += *value;
-    }
-
-    let mean = sum / len;
-    let var = sumsq / len - mean * mean;
-    let std = var.sqrt(/**/) + 1e-5;
-
-    let buf_iter = buf.iter_mut(/**/);
-    let hann_iter = hann.iter(/**/);
-
-    // Log-normalize and apply Hann window
-    for (v, &w) in buf_iter.zip(hann_iter) {
-        *v = (*v - mean) / std * w;
+        let mut buf = to_complex(&buf, 0f32);
+        fft2d(&mut buf, self.pre, false);
+        buf
     }
 }
 
 #[inline]
-fn to_complex(rc: &[f32]) -> Vec<Complex32> {
-    rc.iter(/**/).map(|&val| { 
-        Complex32::new(val, 0f32) 
-    }).collect(/**/)
+fn fft2d(buf: &mut [Complex32], pre: &Precomputed, ifft: bool) {
+    let scale = if ifft { 1f32 / pre.area as f32 } else { 1f32 };
+    let fourier = if ifft { &pre.ifft } else { &pre.fft };
+    fft2dd(buf, fourier, scale, pre.size);
 }
 
 #[inline]
-fn fft2d(fft: &dyn Fft<f32>, n: usize, buf: &mut [Complex32], ifft: bool) {
+fn fft2dd(buf: &mut [Complex32], fourier: &Arc<FftF32>, scale: f32, n: usize) {
     // Applies 2D (row-wise, then column-wise) FFT/IFFT, avoids full transpose
-    let scale = if ifft { 1f32 / (n * n) as f32 } else { 1f32 };
-
-    buf.par_chunks_mut(n).for_each(|val| { 
-        fft.process(val) 
+    buf.par_chunks_mut(n).for_each(|value| {
+        fourier.process(value);
     });
 
     for j in 0..n {
@@ -248,7 +240,7 @@ fn fft2d(fft: &dyn Fft<f32>, n: usize, buf: &mut [Complex32], ifft: bool) {
             col.push(cell); 
         }
 
-        fft.process(&mut col);
+        fourier.process(&mut col);
 
         for i in 0..n { 
             let cell = col[i] * scale;
@@ -258,19 +250,86 @@ fn fft2d(fft: &dyn Fft<f32>, n: usize, buf: &mut [Complex32], ifft: bool) {
 }
 
 #[inline]
-fn random_warp(src: &[f32], dst: &mut [f32], cx: f32, cy: f32, n: usize) {
+fn crop(img: &GrayImage, pre: &Precomputed, cx: f32, cy: f32) -> Vec<f32> {
+    let shift = (pre.size as f32 - 1f32) / 2f32;
+    let mut out = vec![0f32; pre.area];
+    let h = img.height(/**/) as isize;
+    let w = img.width(/**/) as isize;
+
+    out.par_chunks_mut(pre.size).enumerate(/**/).for_each(|(i, row)| {
+           let yf = cy + (i as f32 - shift);
+           let y0 = yf.floor(/**/) as isize;
+           let dy = yf - y0 as f32;
+           let wy0 = 1f32 - dy;
+
+           let y00 = reflect(y0, h);
+           let y01 = reflect(y0 + 1, h);
+           
+           for (j, cell) in row.iter_mut(/**/).enumerate(/**/) {
+                let xf = cx + (j as f32 - shift);
+                let x0 = xf.floor(/**/) as isize;
+                let dx = xf - x0 as f32;
+                let wx0 = 1f32 - dx;
+                let wx1 = dx;
+                
+                let x00 = reflect(x0, w);
+                let x10 = reflect(x0 + 1, w);
+
+                let i00 = img.get_pixel(x00 as u32, y00 as u32)[0] as f32 + 1f32;
+                let i10 = img.get_pixel(x10 as u32, y00 as u32)[0] as f32 + 1f32;
+                let i01 = img.get_pixel(x00 as u32, y01 as u32)[0] as f32 + 1f32;
+                let i11 = img.get_pixel(x10 as u32, y01 as u32)[0] as f32 + 1f32;
+                *cell = i00 * wx0 * wy0 + i10 * wx1 * wy0 + i01 * wx0 * dy + i11 * wx1 * dy;
+           }
+       });
+
+    out
+}
+
+#[inline]
+fn preprocess(buf: &mut [f32], hann: &[f32], def: f32) {
+    let len = buf.len(/**/) as f32;
+    let mut sum = def;
+    let mut sq = def;
+
+    for value in buf.iter_mut(/**/) {
+        *value = value.ln(/**/);
+        sq += *value * *value;
+        sum += *value;
+    }
+
+    let mean = sum / len;
+    let var = sq / len - mean * mean;
+    let std = var.sqrt(/**/) + EPS;
+
+    let buf_iter = buf.iter_mut(/**/);
+    let hann_iter = hann.iter(/**/);
+
+    // Log-normalize and apply Hann window
+    for (v, &w) in buf_iter.zip(hann_iter) {
+        *v = (*v - mean) / std * w;
+    }
+}
+
+#[inline]
+fn to_complex(rc: &[f32], im: f32) -> VecCpx32 {
+    let to_pseudo_complex = |val: &f32| Complex32::new(*val, im);
+    rc.iter(/**/).map(to_pseudo_complex).collect(/**/)
+}
+
+#[inline]
+fn warp(src: &[f32], dst: &mut [f32], cx: f32, cy: f32, n: usize) {
     // Applies random rotation + shear + scale to a given patch
     let mut rng = rand::rng(/**/);
-    let warp = 0.1f32;
-
-    let ang = rng.random_range(-warp..warp);
+    
+    let ang = rng.random_range(-WARP..WARP);
     let c = ang.cos(/**/);
     let s = ang.sin(/**/);
 
-    let w00 = c + rng.random_range(-warp..warp);
-    let w01 = -s + rng.random_range(-warp..warp);
-    let w10 = s + rng.random_range(-warp..warp);
-    let w11 = c + rng.random_range(-warp..warp);
+    let w00 = c + rng.random_range(-WARP..WARP);
+    let w01 = -s + rng.random_range(-WARP..WARP);
+    let w10 = s + rng.random_range(-WARP..WARP);
+    let w11 = c + rng.random_range(-WARP..WARP);
 
     let w02 = cx - (w00 * cx + w01 * cy);
     let w12 = cy - (w10 * cx + w11 * cy);
@@ -279,36 +338,70 @@ fn random_warp(src: &[f32], dst: &mut [f32], cx: f32, cy: f32, n: usize) {
         for j in 0..n as isize {
             let u = w00 * j as f32 + w01 * i as f32 + w02;
             let v = w10 * j as f32 + w11 * i as f32 + w12;
-            let ui = reflect(u.round(/**/) as isize, n as isize);
-            let vi = reflect(v.round(/**/) as isize, n as isize);
+
+            // integer base + fraction
+            let x0 = u.floor(/**/) as isize;
+            let y0 = v.floor(/**/) as isize;
+            let dx = u - x0 as f32;
+            let dy = v - y0 as f32;
+
+            // reflect101 on four corners
+            let x00 = reflect(x0, n as isize) as usize;
+            let y00 = reflect(y0, n as isize) as usize;
+            let x10 = reflect(x0 + 1, n as isize) as usize;
+            let y01 = reflect(y0 + 1, n as isize) as usize;
+
+            let i00 = src[y00 * n + x00];
+            let i10 = src[y00 * n + x10];
+            let i01 = src[y01 * n + x00];
+            let i11 = src[y01 * n + x10];
+
+            // bilinear interpolate
+            let t0 = i00 * (1.0 - dx) + i10 * dx;
+            let t1 = i01 * (1.0 - dx) + i11 * dx;
             let index = (i as usize) * n + (j as usize);
-            dst[index] = src[vi * n + ui];
+            dst[index] = t0 * (1.0 - dy) + t1 * dy;
         }
     }
 }
 
 #[inline]
 fn reflect(idx: isize, len: isize) -> usize {
-    // Same as BORDER_REFLECT in opencv
+    // Mirror‐border reflect with 101 behavior
     let mut x = idx;
 
     while x < 0 || x >= len {
-        x = if x < 0 { -x - 1 } else { 2 * len - x - 1 };
+        x = if x < 0 {
+            -x
+        } else {
+            2 * len - x
+        };
     }
-
+    
     x as usize
 }
 
-fn main() {
-    let mut planner = FftPlanner::<f32>::new();
-    let img = GrayImage::from_pixel(800,800,Luma([128]));
-    let _ = Mosse::new(&mut planner, &img, 80, 80, 640);
-    let now = std::time::Instant::now();
-    let mut mosse = Mosse::new(&mut planner, &img, 80, 80, 640);
-    println!("init time: {:?}", now.elapsed());
+fn main(/**/) {
+    let mut cache = Cache { 
+        planner: FftPlanner::new(/**/),
+        cache: Vec::new(/**/)
+    };
 
-    let now = std::time::Instant::now();
-    let res = mosse.update(&img, 80f32, 80f32);
-    println!("update time: {:?}", now.elapsed());
-    println!("result: {:?}", res);
+    let img = GrayImage::from_pixel(800, 800, Luma([128]));
+    let raw_size = 640;
+    let x0 = 80f32;
+    let y0 = 80f32;
+
+    let now = Instant::now();
+    let _ = Mosse::new(&mut cache, &img, x0, y0, raw_size);
+    println!("init time cold: {:?}", now.elapsed(/**/));
+
+    let now = Instant::now();
+    let mut mosse = Mosse::new(&mut cache, &img, x0, y0, raw_size);
+    println!("init time warm: {:?}", now.elapsed(/**/));
+
+    let now = Instant::now();
+    let result = mosse.update(&img);
+    println!("update time: {:?}", now.elapsed(/**/));
+    println!("result: {:?}", result);
 }
