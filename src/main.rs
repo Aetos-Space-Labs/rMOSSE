@@ -93,13 +93,15 @@ struct Mosse<'a> {
     h: VecCpx32,
     a: VecCpx32,
     b: VecCpx32,
+    psr: f32,
     cx: f32,
     cy: f32,
 }
 
 impl<'a> Mosse<'a> {
-    fn new(cache: &'a mut Cache, img: &GrayImage, cx: f32, cy: f32, raw_size: usize) -> Self {
-        let size = optimal_dft::get_optimal_dft_size(raw_size);
+    fn new(cache: &'a mut Cache, img: &GrayImage, cx: f32, cy: f32, size: usize) -> Self {
+        // Since we adjust an actual bbox size our cache won't grow too much
+        let size = optimal_dft::get_optimal_dft_size(size);
         let pre = cache.get(size);
 
         let patch = crop(img, pre, cx, cy);
@@ -149,8 +151,9 @@ impl<'a> Mosse<'a> {
             *a / (*b + EPSCPX)
         }).collect(/**/);
         
+        let psr = std::f32::MAX;
         let scratch = vec![Complex32::ZERO; pre.area];
-        Mosse { pre, scratch, h, a, b, cx, cy }
+        Mosse { pre, scratch, h, a, b, psr, cx, cy }
     }
 
     fn update(&mut self, img: &GrayImage) -> Option<(f32, f32)> {
@@ -181,7 +184,9 @@ impl<'a> Mosse<'a> {
 
         let mean = sum / self.pre.area as f32;
         let var = sumsq / self.pre.area as f32 - mean * mean;
-        if (maxv - mean) / var.sqrt(/**/).max(EPS) < PSR {
+        self.psr = (maxv - mean) / var.sqrt(/**/).max(EPS);
+
+        if self.psr < PSR {
             return None;
         }
     
