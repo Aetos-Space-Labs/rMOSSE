@@ -7,7 +7,7 @@ use rayon::prelude::*;
 use std::sync::Arc;
 use rand::Rng;
 
-type VecCpx32 = Vec<Complex32>;
+type VecCpxF32 = Vec<Complex32>;
 type FftF32 = dyn Fft<f32>;
 
 const PSR: f32 = 5.7;
@@ -16,10 +16,28 @@ const WARP: f32 = 0.1;
 const LEARNRATE: f32 = 0.2;
 const EPSCPX: Complex32 = Complex32::new(EPS, 0f32);
 
+#[derive(Clone, Copy, Debug)]
+struct AbsBox {
+    top: f32,
+    left: f32,
+    width: f32,
+    height: f32,
+}
+
+impl AbsBox {
+    fn dims(&self) -> (usize, f32, f32) {
+        let size = self.width.max(self.height) as usize;
+        let size = optimal_dft::get_optimal_dft_size(size);
+        let cy = self.top + self.height / 2f32;
+        let cx = self.left + self.width / 2f32;
+        (size, cx, cy)
+    }
+}
+
 struct Precomputed {
     fft: Arc<FftF32>,
     ifft: Arc<FftF32>,
-    gaussian: VecCpx32,
+    gaussian: VecCpxF32,
     hann: Vec<f32>,
     size: usize,
     area: usize,
@@ -64,55 +82,56 @@ impl Precomputed {
         let mut gaussian = to_complex(&gaussian, 0f32);
         fft2dd(&mut gaussian, &fft, 1f32, size);
 
-        Precomputed { fft, ifft, gaussian, hann, size, area, cx }
+        Self { fft, ifft, gaussian, hann, size, area, cx }
     }
 }
 
 struct Cache {
     planner: FftPlanner<f32>,
-    cache: Vec<Precomputed>,
+    cache: Vec<Arc<Precomputed>>,
 }
 
 impl Cache {
-    fn get(&mut self, size: usize) -> &Precomputed {
+    fn get(&mut self, size: usize) -> Arc<Precomputed> {
         if let Some(idx) = self.cache.iter(/**/).position(|pre| pre.size == size) {
             // Internally we only do square bounding boxes to simplify things
             // Among other perks this allows for simple caching mechanism
-            return &self.cache[idx];
+            return self.cache[idx].clone(/**/);
         }
-        
-        let fresh_precomputed = Precomputed::new(&mut self.planner, size);
-        self.cache.push(fresh_precomputed);
-        self.cache.last(/**/).unwrap(/**/)
+
+        let fresh = Arc::new(Precomputed::new(&mut self.planner, size));
+        self.cache.push(fresh.clone(/**/));
+        fresh
     }
 }
 
-struct Mosse<'a> {
-    pre: &'a Precomputed,
-    scratch: VecCpx32,
-    h: VecCpx32,
-    a: VecCpx32,
-    b: VecCpx32,
+struct Mosse {
+    pre: Arc<Precomputed>,
+    scratch: VecCpxF32,
+    h: VecCpxF32,
+    a: VecCpxF32,
+    b: VecCpxF32,
+    bbox: AbsBox,
     psr: f32,
     cx: f32,
     cy: f32,
 }
 
-impl<'a> Mosse<'a> {
-    fn new(cache: &'a mut Cache, img: &GrayImage, cx: f32, cy: f32, size: usize) -> Self {
+impl Mosse {
+    fn new(cache: &mut Cache, img: &GrayImage, bbox: AbsBox) -> Self {
         // Since we adjust an actual bbox size our cache won't grow too much
-        let size = optimal_dft::get_optimal_dft_size(size);
+        let (size, cx, cy) = bbox.dims(/**/);
         let pre = cache.get(size);
 
-        let patch = crop(img, pre, cx, cy);
-        let parts: Vec<(VecCpx32, VecCpx32)> =
+        let patch = crop(img, &pre, cx, cy);
+        let parts: Vec<(VecCpxF32, VecCpxF32)> =
             (0..8).into_par_iter(/**/).map(|_| {
                 let mut target = vec![0f32; pre.area];
                 warp(&patch, &mut target, pre.cx, pre.cx, size);
                 preprocess(&mut target, &pre.hann, 0f32);
 
                 let mut target = to_complex(&target, 0f32);
-                fft2d(&mut target, pre, false);
+                fft2d(&mut target, &pre, false);
 
                 let mut apass = vec![Complex32::ZERO; pre.area];
                 let mut bpass = vec![Complex32::ZERO; pre.area];
@@ -153,10 +172,10 @@ impl<'a> Mosse<'a> {
         
         let psr = std::f32::MAX;
         let scratch = vec![Complex32::ZERO; pre.area];
-        Mosse { pre, scratch, h, a, b, psr, cx, cy }
+        Self { pre, scratch, h, a, b, bbox, psr, cx, cy }
     }
 
-    fn update(&mut self, img: &GrayImage) -> Option<(f32, f32)> {
+    fn update(&mut self, img: &GrayImage) -> Option<AbsBox> {
         let current = self.extract_and_fft(img);
     
         for i in 0..self.pre.area {
@@ -164,7 +183,7 @@ impl<'a> Mosse<'a> {
             self.scratch[i] = current[i] * filter;
         }
 
-        fft2d(&mut self.scratch, self.pre, true);
+        fft2d(&mut self.scratch, &self.pre, true);
     
         let mut sum = 0f32;
         let mut sumsq = 0f32;
@@ -192,10 +211,13 @@ impl<'a> Mosse<'a> {
     
         let row = idx / self.pre.size;
         let col = idx % self.pre.size;
-        self.cx += col as f32 - (self.pre.size as f32 / 2f32);
-        self.cy += row as f32 - (self.pre.size as f32 / 2f32);
+        let dx = col as f32 - (self.pre.size as f32 / 2f32);
+        let dy = row as f32 - (self.pre.size as f32 / 2f32);
+        self.bbox.left += dx;
+        self.bbox.top += dy;
+        self.cx += dx;
+        self.cy += dy;
         
-        let result = (self.cx, self.cy);
         let next = self.extract_and_fft(img);
 
         for i in 0..self.pre.area {
@@ -206,19 +228,91 @@ impl<'a> Mosse<'a> {
             self.h[i] = self.a[i] / (self.b[i] + EPSCPX);
         }
         
-        Some(result)
+        Some(self.bbox)
     }
 
     #[inline]
-    fn extract_and_fft(&self, img: &GrayImage) -> VecCpx32 {
-        let mut buf = crop(img, self.pre, self.cx, self.cy);
+    fn extract_and_fft(&self, img: &GrayImage) -> VecCpxF32 {
+        let mut buf = crop(img, &self.pre, self.cx, self.cy);
         preprocess(&mut buf, &self.pre.hann, 0f32);
 
         let mut buf = to_complex(&buf, 0f32);
-        fft2d(&mut buf, self.pre, false);
+        fft2d(&mut buf, &self.pre, false);
         buf
     }
 }
+
+struct MultiMosse {
+    trackers: Vec<Mosse>,
+    threshold2: f32,
+    max: usize,
+}
+
+impl MultiMosse {
+    fn new(max: usize, threshold2: f32) -> Self {
+        let trackers = Vec::with_capacity(max);
+        Self { trackers, threshold2, max }
+    }
+
+    fn step(&mut self, detections: &[AbsBox], img: &GrayImage, cache: &mut Cache) -> Vec<AbsBox> {
+        let mut update_results = Vec::with_capacity(self.max);
+        let mut new_trackers = Vec::with_capacity(self.max);
+        let mut survivors = Vec::with_capacity(self.max);
+        let mut replaced = vec![false; 20];
+
+        for &bbox in detections {
+            let (_, cx, cy) = bbox.dims(/**/);
+            let mut best: Option<(usize, f32)> = None;
+            for (i, m) in self.trackers.iter(/**/).enumerate(/**/) {
+                // Unless already replaced, find the closest active tracker
+                // That tracker then gets replaced, we treat it as best candidate
+
+                if !replaced[i] {
+                    let dx = m.cx - cx;
+                    let dy = m.cy - cy;
+                    let dist2 = dx * dx + dy * dy;
+
+                    if dist2 < self.threshold2 && best.map_or(true, |val| dist2 < val.1) {
+                        // Filter by closest distance and by predefined threshold
+                        let new_best = (i, dist2);
+                        best = Some(new_best);
+                    }
+                }
+            }
+
+            if let Some(val) = best {
+                let mosse = Mosse::new(cache, img, bbox);
+                new_trackers.push(mosse);
+                replaced[val.0] = true;
+            } else {
+                let num_replaced = replaced.iter(/**/).filter(|&&value| value).count(/**/);
+                if self.trackers.len(/**/) - num_replaced + new_trackers.len(/**/) < self.max {
+                    // We never replace active trackers and let them naturally die out instead
+                    let mosse = Mosse::new(cache, img, bbox);
+                    new_trackers.push(mosse);
+                }
+            }
+        }
+
+        for (i, mut m) in self.trackers.drain(..).enumerate(/**/) {
+            // Retain trackers which are not replaced and have high PSR
+            // We do update on untouched and replace with new in one pass
+
+            if !replaced[i] { 
+                if let Some(bbox) = m.update(img) {
+                    update_results.push(bbox);
+                    survivors.push(m);
+                }
+            }
+        }
+
+        survivors.extend(new_trackers);
+        self.trackers = survivors;
+        update_results
+    }
+}
+
+// Utils
 
 #[inline]
 fn fft2d(buf: &mut [Complex32], pre: &Precomputed, ifft: bool) {
@@ -254,13 +348,14 @@ fn fft2dd(buf: &mut [Complex32], fourier: &Arc<FftF32>, scale: f32, n: usize) {
 
 #[inline]
 fn crop(img: &GrayImage, pre: &Precomputed, cx: f32, cy: f32) -> Vec<f32> {
+    // Bilinear interpolation + mirror-border reflection for out-of-border regions
     let shift = (pre.size as f32 - 1f32) / 2f32;
     let mut out = vec![0f32; pre.area];
     let h = img.height(/**/) as isize;
     let w = img.width(/**/) as isize;
 
-    out.par_chunks_mut(pre.size).enumerate(/**/).for_each(|(i, row)| {
-           let yf = cy + (i as f32 - shift);
+    out.par_chunks_mut(pre.size).enumerate(/**/).for_each(|row| {
+           let yf = cy + (row.0 as f32 - shift);
            let y0 = yf.floor(/**/) as isize;
            let dy = yf - y0 as f32;
            let wy0 = 1f32 - dy;
@@ -268,7 +363,7 @@ fn crop(img: &GrayImage, pre: &Precomputed, cx: f32, cy: f32) -> Vec<f32> {
            let y00 = reflect(y0, h);
            let y01 = reflect(y0 + 1, h);
            
-           for (j, cell) in row.iter_mut(/**/).enumerate(/**/) {
+           for (j, cell) in row.1.iter_mut(/**/).enumerate(/**/) {
                 let xf = cx + (j as f32 - shift);
                 let x0 = xf.floor(/**/) as isize;
                 let dx = xf - x0 as f32;
@@ -315,7 +410,7 @@ fn preprocess(buf: &mut [f32], hann: &[f32], def: f32) {
 }
 
 #[inline]
-fn to_complex(rc: &[f32], im: f32) -> VecCpx32 {
+fn to_complex(rc: &[f32], im: f32) -> VecCpxF32 {
     let to_pseudo_complex = |val: &f32| Complex32::new(*val, im);
     rc.iter(/**/).map(to_pseudo_complex).collect(/**/)
 }
@@ -388,16 +483,15 @@ fn main(/**/) {
     };
 
     let img = GrayImage::from_pixel(800, 800, Luma([128]));
-    let raw_size = 640;
-    let x0 = 80f32;
-    let y0 = 80f32;
 
     let now = Instant::now();
-    let _ = Mosse::new(&mut cache, &img, x0, y0, raw_size);
+    let bbox = AbsBox { top: 80f32, left: 80f32, width: 640f32, height: 640f32 };
+    let _ = Mosse::new(&mut cache, &img, bbox);
     println!("init time cold: {:?}", now.elapsed(/**/));
 
     let now = Instant::now();
-    let mut mosse = Mosse::new(&mut cache, &img, x0, y0, raw_size);
+    let bbox = AbsBox { top: 80f32, left: 80f32, width: 640f32, height: 640f32 };
+    let mut mosse = Mosse::new(&mut cache, &img, bbox);
     println!("init time warm: {:?}", now.elapsed(/**/));
 
     let now = Instant::now();
