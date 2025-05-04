@@ -368,7 +368,6 @@ fn crop(img: &GrayImage, pre: &Precomputed, cx: f32, cy: f32) -> Vec<f32> {
                 let x0 = xf.floor(/**/) as isize;
                 let dx = xf - x0 as f32;
                 let wx0 = 1f32 - dx;
-                let wx1 = dx;
                 
                 let x00 = reflect(x0, w);
                 let x10 = reflect(x0 + 1, w);
@@ -377,7 +376,7 @@ fn crop(img: &GrayImage, pre: &Precomputed, cx: f32, cy: f32) -> Vec<f32> {
                 let i10 = img.get_pixel(x10 as u32, y00 as u32)[0] as f32 + 1f32;
                 let i01 = img.get_pixel(x00 as u32, y01 as u32)[0] as f32 + 1f32;
                 let i11 = img.get_pixel(x10 as u32, y01 as u32)[0] as f32 + 1f32;
-                *cell = i00 * wx0 * wy0 + i10 * wx1 * wy0 + i01 * wx0 * dy + i11 * wx1 * dy;
+                *cell = i00 * wx0 * wy0 + i10 * dx * wy0 + i01 * wx0 * dy + i11 * dx * dy;
            }
        });
 
