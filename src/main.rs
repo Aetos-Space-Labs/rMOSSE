@@ -250,7 +250,6 @@ struct MultiMosse {
 
 impl MultiMosse {
     fn step(&mut self, detections: &[AbsBox], img: &GrayImage, cache: &mut Cache) -> Vec<AbsBox> {
-        let mut update_results = Vec::with_capacity(MAXTARGETS);
         let mut new_trackers = Vec::with_capacity(MAXTARGETS);
         let mut survivors = Vec::with_capacity(MAXTARGETS);
         let mut replaced = vec![false; MAXTARGETS];
@@ -292,19 +291,19 @@ impl MultiMosse {
         for (i, mut m) in self.trackers.drain(..).enumerate(/**/) {
             // Retain trackers which are not replaced and have high PSR
             // We do update on untouched and replace with new in one pass
-
-            if !replaced[i] { 
-                if let Some(bbox) = m.update(img) {
-                    update_results.push(bbox);
-                    survivors.push(m);
-                }
+            if !replaced[i] && m.update(img).is_some(/**/) { 
+                survivors.push(m);
             }
         }
 
         survivors.extend(new_trackers);
         survivors.truncate(MAXTARGETS);
         self.trackers = survivors;
-        update_results
+
+        self.trackers
+            .iter(/**/)
+            .map(|m| m.bbox)
+            .collect(/**/)
     }
 }
 
