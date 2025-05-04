@@ -11,10 +11,11 @@ type VecCpxF32 = Vec<Complex32>;
 type FftF32 = dyn Fft<f32>;
 
 const PSR: f32 = 5.7;
-const EPS: f32 = 1e-5;
 const WARP: f32 = 0.1;
+const EPS: f32 = 0.00001;
 const LEARNRATE: f32 = 0.2;
 const EPSCPX: Complex32 = Complex32::new(EPS, 0f32);
+const MAXTARGETS: usize = 10;
 
 #[derive(Clone, Copy, Debug)]
 struct AbsBox {
@@ -245,20 +246,14 @@ impl Mosse {
 struct MultiMosse {
     trackers: Vec<Mosse>,
     threshold2: f32,
-    max: usize,
 }
 
 impl MultiMosse {
-    fn new(max: usize, threshold2: f32) -> Self {
-        let trackers = Vec::with_capacity(max);
-        Self { trackers, threshold2, max }
-    }
-
     fn step(&mut self, detections: &[AbsBox], img: &GrayImage, cache: &mut Cache) -> Vec<AbsBox> {
-        let mut update_results = Vec::with_capacity(self.max);
-        let mut new_trackers = Vec::with_capacity(self.max);
-        let mut survivors = Vec::with_capacity(self.max);
-        let mut replaced = vec![false; 20];
+        let mut update_results = Vec::with_capacity(MAXTARGETS);
+        let mut new_trackers = Vec::with_capacity(MAXTARGETS);
+        let mut survivors = Vec::with_capacity(MAXTARGETS);
+        let mut replaced = vec![false; MAXTARGETS];
 
         for &bbox in detections {
             let (_, cx, cy) = bbox.dims(/**/);
@@ -286,7 +281,7 @@ impl MultiMosse {
                 replaced[val.0] = true;
             } else {
                 let num_replaced = replaced.iter(/**/).filter(|&&value| value).count(/**/);
-                if self.trackers.len(/**/) - num_replaced + new_trackers.len(/**/) < self.max {
+                if self.trackers.len(/**/) - num_replaced + new_trackers.len(/**/) < MAXTARGETS {
                     // We never replace active trackers and let them naturally die out instead
                     let mosse = Mosse::new(cache, img, bbox);
                     new_trackers.push(mosse);
@@ -307,6 +302,7 @@ impl MultiMosse {
         }
 
         survivors.extend(new_trackers);
+        survivors.truncate(MAXTARGETS);
         self.trackers = survivors;
         update_results
     }
