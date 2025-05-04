@@ -14,6 +14,7 @@ type FftF32 = dyn Fft<f32>;
 const PSR: f32 = 5.7;
 const WARP: f32 = 0.1;
 const EPS: f32 = 0.00001;
+const SIGMAREL: f32 = 0.1;
 const LEARNRATE: f32 = 0.2;
 const EPSCPX: Complex32 = Complex32::new(EPS, 0f32);
 const MAXTARGETS: usize = 10;
@@ -56,14 +57,18 @@ impl Precomputed {
         // Hann window tapering function
         // Combats Heisenberg uncertainty
         let mut hann = Vec::with_capacity(area);
-        let pi2 = 2f32 * std::f32::consts::PI;
-
+        
         // Represents an ideal response
         // Peaks at center of bounding box
         let mut gaussian = Vec::with_capacity(area);
         let ifft = planner.plan_fft_inverse(size);
         let fft = planner.plan_fft_forward(size);
-        
+
+        // Scales with patch size
+        let sigma = nm * SIGMAREL;
+        let sigma22 = 2f32 * sigma * sigma;
+        let pi2 = 2f32 * std::f32::consts::PI;
+
         for i in 0..size {
             // Optimization: compute this once per row
             let wy = 1f32 - (pi2 * i as f32 / nm).cos(/**/);
@@ -71,7 +76,7 @@ impl Precomputed {
             
             for j in 0..size {
                 let dx = j as f32 - cx;
-                let result = (-0.5 * (dx * dx + dy * dy) / 4f32).exp(/**/);
+                let result = (-(dx * dx + dy * dy) / sigma22).exp(/**/);
                 let wx = 1f32 - (pi2 * j as f32 / nm).cos(/**/);
                 hann.push(wy * wx / 4f32);
                 gaussian.push(result);
