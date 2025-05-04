@@ -1,6 +1,7 @@
 mod optimal_dft;
 
 use rustfft::{num_complex::Complex32, Fft, FftPlanner};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use image::{GrayImage, Luma};
 use std::time::Instant;
 use rayon::prelude::*;
@@ -166,9 +167,8 @@ impl Mosse {
         let aiter = a.iter(/**/);
         let biter = b.iter(/**/);
 
-        let h = aiter.zip(biter).map(|(a, b)| {
-            // Build an actual correlation filter
-            *a / (*b + EPSCPX)
+        let h = aiter.zip(biter).map(|ab| {
+            *ab.0 / (*ab.1 + EPSCPX)
         }).collect(/**/);
         
         let psr = std::f32::MAX;
@@ -250,6 +250,8 @@ struct MultiMosse {
 
 impl MultiMosse {
     fn step(&mut self, detections: &[AbsBox], img: &GrayImage, cache: &mut Cache) -> Vec<AbsBox> {
+        // There exists some detector which periodically gives us a list of found bounding boxes
+        // Our job is to track underlying objects for as long as possible until next list
         let mut new_trackers = Vec::with_capacity(MAXTARGETS);
         let mut survivors = Vec::with_capacity(MAXTARGETS);
         let mut replaced = vec![false; MAXTARGETS];
@@ -323,22 +325,29 @@ fn fft2dd(buf: &mut [Complex32], fourier: &Arc<FftF32>, scale: f32, n: usize) {
         fourier.process(value);
     });
 
-    for j in 0..n {
-        // This factually builds a column
+    let ptr = buf.as_mut_ptr(/**/);
+    let ptr_atom = AtomicPtr::new(ptr);
+
+    (0..n).into_par_iter(/**/).for_each(|row| {
+        let ptr = ptr_atom.load(Ordering::Relaxed);
         let mut col = Vec::with_capacity(n);
+        
+        unsafe {
+            for i in 0..n {
+                let index = i * n + row;
+                let val = ptr.add(index);
+                col.push(*val);
+            }
 
-        for i in 0..n { 
-            let cell = buf[i * n + j];
-            col.push(cell); 
+            fourier.process(&mut col);
+
+            for i in 0..n {
+                let index = i * n + row;
+                let val = col[i] * scale;
+                *ptr.add(index) = val;
+            }
         }
-
-        fourier.process(&mut col);
-
-        for i in 0..n { 
-            let cell = col[i] * scale;
-            buf[i * n + j] = cell;
-        }
-    }
+    });
 }
 
 #[inline]
@@ -372,7 +381,7 @@ fn crop(img: &GrayImage, pre: &Precomputed, cx: f32, cy: f32) -> Vec<f32> {
                 let i01 = img.get_pixel(x00 as u32, y01 as u32)[0] as f32 + 1f32;
                 let i11 = img.get_pixel(x10 as u32, y01 as u32)[0] as f32 + 1f32;
                 *cell = i00 * wx0 * wy0 + i10 * dx * wy0 + i01 * wx0 * dy + i11 * dx * dy;
-           }
+            }
        });
 
     out
