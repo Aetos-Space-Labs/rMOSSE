@@ -16,8 +16,11 @@ const WARP: f32 = 0.1;
 const EPS: f32 = 0.00001;
 const SIGMAREL: f32 = 0.1;
 const LEARNRATE: f32 = 0.2;
-const EPSCPX: Complex32 = Complex32::new(EPS, 0f32);
 const MAXTARGETS: usize = 10;
+const EXCLUDE: isize = 6;
+
+const EPSCPX: Complex32 = 
+    Complex32::new(EPS, 0f32);
 
 #[derive(Clone, Copy, Debug)]
 struct AbsBox {
@@ -48,7 +51,7 @@ struct Precomputed {
 }
 
 impl Precomputed {
-    fn new(planner: &mut FftPlanner<f32>, size: usize) -> Self {
+    fn new(planner: &mut FftPlanner<f32>, size: usize) -> Arc<Self> {
         let nm = (size - 1) as f32;
         let area = size * size;
         let cx = nm / 2f32;
@@ -83,13 +86,11 @@ impl Precomputed {
             }
         }
 
-        let max = gaussian.iter(/**/).cloned(/**/).fold(f32::MIN, f32::max);
-        gaussian.iter_mut(/**/).for_each(|value| *value /= max);
-
         let mut gaussian = to_complex(&gaussian, 0f32);
         fft2dd(&mut gaussian, &fft, 1f32, size);
 
-        Self { fft, ifft, gaussian, hann, size, area, cx }
+        let me = Self { fft, ifft, gaussian, hann, size, area, cx };
+        Arc::new(me)
     }
 }
 
@@ -106,9 +107,10 @@ impl Cache {
             return self.cache[idx].clone(/**/);
         }
 
-        let fresh = Arc::new(Precomputed::new(&mut self.planner, size));
-        self.cache.push(fresh.clone(/**/));
-        fresh
+        let pre_arc = Precomputed::new(&mut self.planner, size);
+        let pre_arc_clone = pre_arc.clone(/**/);
+        self.cache.push(pre_arc_clone);
+        pre_arc
     }
 }
 
@@ -183,47 +185,60 @@ impl Mosse {
 
     fn update(&mut self, img: &GrayImage) -> Option<AbsBox> {
         let current = self.extract_and_fft(img);
-    
+
         for i in 0..self.pre.area {
             let filter = self.h[i].conj(/**/);
             self.scratch[i] = current[i] * filter;
         }
 
         fft2d(&mut self.scratch, &self.pre, true);
-    
-        let mut sum = 0f32;
-        let mut sumsq = 0f32;
+
         let mut maxv = f32::MIN;
         let mut idx = 0;
 
         for (i, c) in self.scratch.iter(/**/).enumerate(/**/) {
-            // Compute peak-to-sidelobe ratio in frequency domain
-            sumsq += c.re * c.re;
-            sum += c.re;
-
             if c.re > maxv {
                 maxv = c.re;
                 idx = i;
             }
         }
 
-        let mean = sum / self.pre.area as f32;
-        let var = sumsq / self.pre.area as f32 - mean * mean;
-        self.psr = (maxv - mean) / var.sqrt(/**/).max(EPS);
-
-        if self.psr < PSR {
-            return None;
-        }
-    
         let row = idx / self.pre.size;
         let col = idx % self.pre.size;
-        let dx = col as f32 - (self.pre.size as f32 / 2f32);
-        let dy = row as f32 - (self.pre.size as f32 / 2f32);
+
+        let mut sum = 0f32;
+        let mut sumsq = 0f32;
+        let mut count = 0usize;
+
+        for r in 0..self.pre.size {
+            for c in 0..self.pre.size {
+                let dr = r as isize - row as isize;
+                let dc = c as isize - col as isize;
+                if dr.abs(/**/) > EXCLUDE || dc.abs(/**/) > EXCLUDE {
+                    let value = self.scratch[r * self.pre.size + c].re;
+                    sumsq += value * value;
+                    sum += value;
+                    count += 1;
+                }
+            }
+        }
+
+        let mean = sum / count as f32;
+        let var = sumsq / count as f32 - mean * mean;
+        self.psr = (maxv - mean) / var.sqrt(/**/).max(EPS);
+
+        if self.psr < PSR { 
+            return None; 
+        }
+
+        let shift = self.pre.size as f32 / 2f32;
+        let dx = col as f32 - shift;
+        let dy = row as f32 - shift;
         self.bbox.left += dx;
         self.bbox.top += dy;
         self.cx += dx;
         self.cy += dy;
-        
+
         let next = self.extract_and_fft(img);
 
         for i in 0..self.pre.area {
@@ -233,7 +248,7 @@ impl Mosse {
             self.b[i] = self.b[i] * (1f32 - LEARNRATE) + bn;
             self.h[i] = self.a[i] / (self.b[i] + EPSCPX);
         }
-        
+
         Some(self.bbox)
     }
 
@@ -241,7 +256,6 @@ impl Mosse {
     fn extract_and_fft(&self, img: &GrayImage) -> VecCpxF32 {
         let mut buf = crop(img, &self.pre, self.cx, self.cy);
         preprocess(&mut buf, &self.pre.hann, 0f32);
-
         let mut buf = to_complex(&buf, 0f32);
         fft2d(&mut buf, &self.pre, false);
         buf
@@ -358,13 +372,13 @@ fn fft2dd(buf: &mut [Complex32], fourier: &Arc<FftF32>, scale: f32, n: usize) {
 #[inline]
 fn crop(img: &GrayImage, pre: &Precomputed, cx: f32, cy: f32) -> Vec<f32> {
     // Bilinear interpolation + mirror-border reflection for out-of-border regions
-    let shift = (pre.size as f32 - 1f32) / 2f32;
+    let center_to_left_top = (pre.size as f32 - 1f32) / 2f32;
     let mut out = vec![0f32; pre.area];
     let h = img.height(/**/) as isize;
     let w = img.width(/**/) as isize;
 
     out.par_chunks_mut(pre.size).enumerate(/**/).for_each(|row| {
-           let yf = cy + (row.0 as f32 - shift);
+           let yf = cy + (row.0 as f32 - center_to_left_top);
            let y0 = yf.floor(/**/) as isize;
            let dy = yf - y0 as f32;
            let wy0 = 1f32 - dy;
@@ -373,7 +387,7 @@ fn crop(img: &GrayImage, pre: &Precomputed, cx: f32, cy: f32) -> Vec<f32> {
            let y01 = reflect(y0 + 1, h);
            
            for (j, cell) in row.1.iter_mut(/**/).enumerate(/**/) {
-                let xf = cx + (j as f32 - shift);
+                let xf = cx + (j as f32 - center_to_left_top);
                 let x0 = xf.floor(/**/) as isize;
                 let dx = xf - x0 as f32;
                 let wx0 = 1f32 - dx;
