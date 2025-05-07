@@ -1,9 +1,10 @@
 mod optimal_dft;
 
 use rustfft::{num_complex::Complex32, Fft, FftPlanner};
+use image::{ImageReader, GrayImage, RgbImage, Rgb};
 use std::sync::atomic::{AtomicPtr, Ordering};
-use image::{GrayImage, Luma};
 use std::time::Instant;
+use std::error::Error;
 use rayon::prelude::*;
 use std::sync::Arc;
 use rand::Rng;
@@ -11,21 +12,19 @@ use rand::Rng;
 type VecCpxF32 = Vec<Complex32>;
 type FftF32 = dyn Fft<f32>;
 
-const PSR: f32 = 5.7;
-const WARP: f32 = 0.1;
+const PSR: f32 = 6f32;
+const WARP: f32 = 0.2;
 const EPS: f32 = 0.00001;
-const SIGMAREL: f32 = 0.1;
 const LEARNRATE: f32 = 0.2;
 const MAXTARGETS: usize = 10;
-const EXCLUDE: isize = 6;
 
 const EPSCPX: Complex32 = 
     Complex32::new(EPS, 0f32);
 
 #[derive(Clone, Copy, Debug)]
 struct AbsBox {
-    top: f32,
     left: f32,
+    top: f32,
     width: f32,
     height: f32,
 }
@@ -34,8 +33,8 @@ impl AbsBox {
     fn dims(&self) -> (usize, f32, f32) {
         let size = self.width.max(self.height) as usize;
         let size = optimal_dft::get_optimal_dft_size(size);
-        let cy = self.top + self.height / 2f32;
         let cx = self.left + self.width / 2f32;
+        let cy = self.top + self.height / 2f32;
         (size, cx, cy)
     }
 }
@@ -66,26 +65,25 @@ impl Precomputed {
         let mut gaussian = Vec::with_capacity(area);
         let ifft = planner.plan_fft_inverse(size);
         let fft = planner.plan_fft_forward(size);
-
-        // Scales with patch size
-        let sigma = nm * SIGMAREL;
-        let sigma22 = 2f32 * sigma * sigma;
         let pi2 = 2f32 * std::f32::consts::PI;
+        let sigma22 = 2f32 * 2f32 * 2f32;
 
         for i in 0..size {
-            // Optimization: compute this once per row
+            // Optimization: compute both gaussian and hann here
             let wy = 1f32 - (pi2 * i as f32 / nm).cos(/**/);
             let dy = i as f32 - cy;
-            
+
             for j in 0..size {
                 let dx = j as f32 - cx;
-                let result = (-(dx * dx + dy * dy) / sigma22).exp(/**/);
+                let val = (-(dx * dx + dy * dy) / sigma22).exp(/**/);
                 let wx = 1f32 - (pi2 * j as f32 / nm).cos(/**/);
                 hann.push(wy * wx / 4f32);
-                gaussian.push(result);
+                gaussian.push(val);
             }
         }
 
+        let peak_value = gaussian.iter(/**/).cloned(/**/).fold(0f32, f32::max);
+        for old_value in &mut gaussian { *old_value /= peak_value; }
         let mut gaussian = to_complex(&gaussian, 0f32);
         fft2dd(&mut gaussian, &fft, 1f32, size);
 
@@ -185,55 +183,41 @@ impl Mosse {
 
     fn update(&mut self, img: &GrayImage) -> Option<AbsBox> {
         let current = self.extract_and_fft(img);
-
+    
         for i in 0..self.pre.area {
-            let filter = self.h[i].conj(/**/);
-            self.scratch[i] = current[i] * filter;
+            self.scratch[i] = current[i] * self.h[i];
         }
 
         fft2d(&mut self.scratch, &self.pre, true);
-
+    
+        let mut sum = 0f32;
+        let mut sumsq = 0f32;
         let mut maxv = f32::MIN;
         let mut idx = 0;
 
         for (i, c) in self.scratch.iter(/**/).enumerate(/**/) {
+            // Compute peak-to-sidelobe ratio in frequency domain
+            sumsq += c.re * c.re;
+            sum += c.re;
+
             if c.re > maxv {
                 maxv = c.re;
                 idx = i;
             }
         }
 
-        let row = idx / self.pre.size;
-        let col = idx % self.pre.size;
-
-        let mut sum = 0f32;
-        let mut sumsq = 0f32;
-        let mut count = 0usize;
-
-        for r in 0..self.pre.size {
-            for c in 0..self.pre.size {
-                let dr = r as isize - row as isize;
-                let dc = c as isize - col as isize;
-                if dr.abs(/**/) > EXCLUDE || dc.abs(/**/) > EXCLUDE {
-                    let value = self.scratch[r * self.pre.size + c].re;
-                    sumsq += value * value;
-                    sum += value;
-                    count += 1;
-                }
-            }
-        }
-
-        let mean = sum / count as f32;
-        let var = sumsq / count as f32 - mean * mean;
+        let mean = sum / self.pre.area as f32;
+        let var = sumsq / self.pre.area as f32 - mean * mean;
         self.psr = (maxv - mean) / var.sqrt(/**/).max(EPS);
 
-        if self.psr < PSR { 
-            return None; 
+        if self.psr < PSR {
+            return None;
         }
-
-        let shift = self.pre.size as f32 / 2f32;
-        let dx = col as f32 - shift;
-        let dy = row as f32 - shift;
+    
+        let row = idx / self.pre.size;
+        let col = idx % self.pre.size;
+        let dx = col as f32 - (self.pre.size as f32 / 2f32);
+        let dy = row as f32 - (self.pre.size as f32 / 2f32);
         self.bbox.left += dx;
         self.bbox.top += dy;
         self.cx += dx;
@@ -248,7 +232,7 @@ impl Mosse {
             self.b[i] = self.b[i] * (1f32 - LEARNRATE) + bn;
             self.h[i] = self.a[i] / (self.b[i] + EPSCPX);
         }
-
+        
         Some(self.bbox)
     }
 
@@ -499,25 +483,60 @@ fn reflect(idx: isize, len: isize) -> usize {
 }
 
 fn main(/**/) {
-    let mut cache = Cache { 
-        planner: FftPlanner::new(/**/),
-        cache: Vec::new(/**/)
-    };
 
-    let img = GrayImage::from_pixel(800, 800, Luma([128]));
+}
 
-    let now = Instant::now();
-    let bbox = AbsBox { top: 80f32, left: 80f32, width: 640f32, height: 640f32 };
-    let _ = Mosse::new(&mut cache, &img, bbox);
-    println!("init time cold: {:?}", now.elapsed(/**/));
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let now = Instant::now();
-    let bbox = AbsBox { top: 80f32, left: 80f32, width: 640f32, height: 640f32 };
-    let mut mosse = Mosse::new(&mut cache, &img, bbox);
-    println!("init time warm: {:?}", now.elapsed(/**/));
+    #[test]
+    fn multi_mosse_tracking(/**/) -> Result<(/**/), Box<dyn Error>> {
+        let gray1 = ImageReader::open("frame1.png")?.decode(/**/)?.to_luma8(/**/);
+        let gray2 = ImageReader::open("frame2.png")?.decode(/**/)?.to_luma8(/**/);
+        let mut disp = ImageReader::open("frame2.png")?.decode(/**/)?.to_rgb8(/**/);
 
-    let now = Instant::now();
-    let result = mosse.update(&img);
-    println!("update time: {:?}", now.elapsed(/**/));
-    println!("result: {:?}", result);
+        let mut cache = Cache { 
+            planner: FftPlanner::new(/**/), 
+            cache: Vec::new(/**/),
+        };
+
+        let init_boxes = [
+            AbsBox { left: 195f32, top: 150f32, width: 80f32, height: 50f32 },
+            AbsBox { left: 600f32, top: 200f32, width: 70f32, height: 50f32 },
+            AbsBox { left: 720f32, top: 220f32, width: 80f32, height: 60f32 },
+        ];
+
+        // Initialize trackers on first frame, do not update them
+        let trackers: Vec<Mosse> = init_boxes.iter(/**/).map(|&bbox| {
+            Mosse::new(&mut cache, &gray1, bbox)
+        }).collect(/**/);
+
+        let mut multi = MultiMosse { trackers, threshold2: 2500f32 };
+        // Pretend we have not detected anything, trackers are on their own
+        let out = multi.step(&[], &gray2, &mut cache);
+
+        for b in &out {
+            let x0 = b.left as u32;
+            let y0 = b.top as u32;
+
+            let x1 = x0 + b.width as u32;
+            let y1 = y0 + b.height as u32;
+            let rgb = Rgb([255, 0, 0]);
+
+            for x in x0..x1 {
+                disp.put_pixel(x, y0, rgb);
+                disp.put_pixel(x, y1, rgb);
+            }
+
+            for y in y0..y1 {
+                disp.put_pixel(x0, y, rgb);
+                disp.put_pixel(x1, y, rgb);
+            }
+        }
+
+        disp.save("result.png")?;
+        assert!(out.len() == init_boxes.len(), "lost trackers");
+        Ok((/**/))
+    }
 }
