@@ -1,25 +1,23 @@
-mod optimal_dft;
+#![allow(dead_code)]
 
-use rustfft::{num_complex::Complex32, Fft, FftPlanner};
-use image::{ImageReader, GrayImage, RgbImage, Rgb};
-use std::sync::atomic::{AtomicPtr, Ordering};
-use std::time::Instant;
-use std::error::Error;
+mod optimal_dft;
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicPtr, Ordering};
+use rustfft::{num_complex::Complex32, Fft, FftPlanner};
+use image::GrayImage;
 use std::sync::Arc;
 use rand::Rng;
 
 type VecCpxF32 = Vec<Complex32>;
 type FftF32 = dyn Fft<f32>;
 
-const PSR: f32 = 6f32;
+const PSR: f32 = 5.7;
 const WARP: f32 = 0.2;
 const EPS: f32 = 0.00001;
 const LEARNRATE: f32 = 0.2;
 const MAXTARGETS: usize = 10;
 
-const EPSCPX: Complex32 = 
-    Complex32::new(EPS, 0f32);
+const EPSCPX: Complex32 = Complex32::new(EPS, 0f32);
 
 #[derive(Clone, Copy, Debug)]
 struct AbsBox {
@@ -83,7 +81,7 @@ impl Precomputed {
         }
 
         let peak_value = gaussian.iter(/**/).cloned(/**/).fold(0f32, f32::max);
-        for old_value in &mut gaussian { *old_value /= peak_value; }
+        for current_value in &mut gaussian { *current_value /= peak_value; }
         let mut gaussian = to_complex(&gaussian, 0f32);
         fft2dd(&mut gaussian, &fft, 1f32, size);
 
@@ -98,6 +96,12 @@ struct Cache {
 }
 
 impl Cache {
+    fn new(len: usize) -> Self {
+        let planner = FftPlanner::new(/**/);
+        let cache = Vec::with_capacity(len);
+        Self { planner, cache }
+    }
+
     fn get(&mut self, size: usize) -> Arc<Precomputed> {
         if let Some(idx) = self.cache.iter(/**/).position(|pre| pre.size == size) {
             // Internally we only do square bounding boxes to simplify things
@@ -196,7 +200,7 @@ impl Mosse {
         let mut idx = 0;
 
         for (i, c) in self.scratch.iter(/**/).enumerate(/**/) {
-            // Compute peak-to-sidelobe ratio in frequency domain
+            // Compute peak-to-sidelobe ratio in space domain
             sumsq += c.re * c.re;
             sum += c.re;
 
@@ -216,17 +220,43 @@ impl Mosse {
     
         let row = idx / self.pre.size;
         let col = idx % self.pre.size;
-        let dx = col as f32 - (self.pre.size as f32 / 2f32);
-        let dy = row as f32 - (self.pre.size as f32 / 2f32);
-        self.bbox.left += dx;
-        self.bbox.top += dy;
-        self.cx += dx;
-        self.cy += dy;
+
+        let resp_at = |r: isize, c: isize| -> f32 {
+            let r = r.clamp(0, self.pre.size as isize - 1) as usize;
+            let c = c.clamp(0, self.pre.size as isize - 1) as usize;
+            self.scratch[r * self.pre.size + c].re
+        };
+
+        let c_val = resp_at(row as isize, col as isize);
+        let l_val = resp_at(row as isize, col as isize - 1);
+        let r_val = resp_at(row as isize, col as isize + 1);
+        let t_val = resp_at(row as isize - 1, col as isize);
+        let b_val = resp_at(row as isize + 1, col as isize);
+
+        let denom_x = 2f32 * c_val - l_val - r_val;
+        let denom_y = 2f32 * c_val - t_val - b_val;
+
+        let dx = if denom_x.abs(/**/) < EPS { 0f32 } else { 
+            (r_val - l_val) / (2f32 * denom_x) 
+        };
+        
+        let dy = if denom_y.abs(/**/) < EPS { 0f32 } else { 
+            (b_val - t_val) / (2f32 * denom_y) 
+        };
+
+        let offset = (self.pre.size as f32 - 1f32) / 2f32;
+        let dx_shift = col as f32 + dx - offset;
+        let dy_shift = row as f32 + dy - offset;
+
+        self.bbox.left += dx_shift;
+        self.bbox.top += dy_shift;
+        self.cx += dx_shift;
+        self.cy += dy_shift;
 
         let next = self.extract_and_fft(img);
 
         for i in 0..self.pre.area {
-            let an = self.h[i] * next[i].conj(/**/) * LEARNRATE;
+            let an = self.pre.gaussian[i] * next[i].conj(/**/) * LEARNRATE;
             let bn = next[i] * next[i].conj(/**/) * LEARNRATE;
             self.a[i] = self.a[i] * (1f32 - LEARNRATE) + an;
             self.b[i] = self.b[i] * (1f32 - LEARNRATE) + bn;
@@ -318,7 +348,7 @@ impl MultiMosse {
 fn fft2d(buf: &mut [Complex32], pre: &Precomputed, ifft: bool) {
     let scale = if ifft { 1f32 / pre.area as f32 } else { 1f32 };
     let fourier = if ifft { &pre.ifft } else { &pre.fft };
-    fft2dd(buf, fourier, scale, pre.size);
+    fft2dd(buf, fourier, scale, pre.size)
 }
 
 #[inline]
@@ -350,7 +380,7 @@ fn fft2dd(buf: &mut [Complex32], fourier: &Arc<FftF32>, scale: f32, n: usize) {
                 *ptr.add(index) = val;
             }
         }
-    });
+    })
 }
 
 #[inline]
@@ -483,11 +513,27 @@ fn reflect(idx: isize, len: isize) -> usize {
 }
 
 fn main(/**/) {
+    let img = GrayImage::new(800u32, 800u32);
+    let bbox = AbsBox { left: 80.0, top: 80.0, width: 640.0, height: 640.0 };
+    let mut cache = Cache::new(optimal_dft::LEN);
+    let _ = Mosse::new(&mut cache, &img, bbox);
 
+    let t0 = std::time::Instant::now(/**/);
+    let mut mosse = Mosse::new(&mut cache, &img, bbox);
+    let init_time = t0.elapsed(/**/);
+
+    let t1 = std::time::Instant::now(/**/);
+    let _ = mosse.update(&img);
+    let upd_time = t1.elapsed(/**/);
+
+    println!("init: {:.3?} ms", init_time);
+    println!("update: {:.3?} ms", upd_time);
 }
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+    use image::{ImageReader, Rgb};
     use super::*;
 
     #[test]
@@ -495,11 +541,7 @@ mod tests {
         let gray1 = ImageReader::open("frame1.png")?.decode(/**/)?.to_luma8(/**/);
         let gray2 = ImageReader::open("frame2.png")?.decode(/**/)?.to_luma8(/**/);
         let mut disp = ImageReader::open("frame2.png")?.decode(/**/)?.to_rgb8(/**/);
-
-        let mut cache = Cache { 
-            planner: FftPlanner::new(/**/), 
-            cache: Vec::new(/**/),
-        };
+        let mut cache = Cache::new(optimal_dft::LEN);
 
         let init_boxes = [
             AbsBox { left: 195f32, top: 150f32, width: 80f32, height: 50f32 },
@@ -536,7 +578,8 @@ mod tests {
         }
 
         disp.save("result.png")?;
-        assert!(out.len() == init_boxes.len(), "lost trackers");
+        let nothing_lost = out.len(/**/) == init_boxes.len(/**/);
+        assert!(nothing_lost, "lost trackers");
         Ok((/**/))
     }
 }

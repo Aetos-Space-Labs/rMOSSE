@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rand = "0.9.1"
 image = "0.25.6"
 rayon = "1.10.0"
 rustfft = "6.3"
+rand = "0.9.1"
 
 [profile.release]
 overflow-checks = false

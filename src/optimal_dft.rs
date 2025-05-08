@@ -7,7 +7,7 @@ static OPTIMAL_DFT_SIZE_TAB: &[usize] = &[
     1215, 1250, 1280
 ];
 
-static LEN: usize = OPTIMAL_DFT_SIZE_TAB.len(/**/);
+pub static LEN: usize = OPTIMAL_DFT_SIZE_TAB.len(/**/);
 
 pub fn get_optimal_dft_size(size: usize) -> usize {
     match OPTIMAL_DFT_SIZE_TAB.binary_search(&size) {
