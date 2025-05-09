@@ -10,6 +10,8 @@ Besides basic single-object tracking we have an efficient multi-tracking interfa
 |---------------:|--------------:|-----------------:|
 | **rMOSSE** x86 | **31.93** | **4.33** |
 | OpenCV baseline x86 | 61.00 | 12.63 |
+| **rMOSSE** ARM | **193.21** | **28.2** |
+| OpenCV baseline ARM | 392.17 | 97.88 |
 
 ### Visual comparison
 
