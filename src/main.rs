@@ -28,7 +28,7 @@ struct AbsBox {
 }
 
 impl AbsBox {
-    fn dims(&self) -> (usize, f32, f32) {
+    fn square(&self) -> (usize, f32, f32) {
         let size = self.width.max(self.height) as usize;
         let size = optimal_dft::get_optimal_dft_size(size);
         let cx = self.left + self.width / 2f32;
@@ -131,7 +131,7 @@ struct Mosse {
 impl Mosse {
     fn new(cache: &mut Cache, img: &GrayImage, bbox: AbsBox) -> Self {
         // Since we adjust an actual bbox size our cache won't grow too much
-        let (size, cx, cy) = bbox.dims(/**/);
+        let (size, cx, cy) = bbox.square(/**/);
         let pre = cache.get(size);
 
         let patch = crop(img, &pre, cx, cy);
@@ -290,7 +290,7 @@ impl MultiMosse {
         let mut replaced = vec![false; MAXTARGETS];
 
         for &bbox in detections {
-            let (_, cx, cy) = bbox.dims(/**/);
+            let (_, cx, cy) = bbox.square(/**/);
             let mut best: Option<(usize, f32)> = None;
             for (i, m) in self.trackers.iter(/**/).enumerate(/**/) {
                 // Unless already replaced, find the closest active tracker
@@ -386,6 +386,7 @@ fn fft2dd(buf: &mut [Complex32], fourier: &Arc<FftF32>, scale: f32, n: usize) {
 #[inline]
 fn crop(img: &GrayImage, pre: &Precomputed, cx: f32, cy: f32) -> Vec<f32> {
     // Bilinear interpolation + mirror-border reflection for out-of-border regions
+    // This method expects an image center and then computes its top/left point
     let center_to_left_top = (pre.size as f32 - 1f32) / 2f32;
     let mut out = vec![0f32; pre.area];
     let h = img.height(/**/) as isize;
