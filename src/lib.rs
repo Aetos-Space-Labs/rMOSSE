@@ -172,7 +172,7 @@ impl Mosse {
         crop(giw, &pre, &mut alloc_patch, cx, cy);
 
         alloc_warp.par_chunks_mut(pre.area).enumerate(/**/).for_each(|itarget| unsafe {
-            // Use pointer arithmetic to avoid per-wrap apass/bpass heap allocations
+            // Use pointer arithmetic to avoid per-warp apass/bpass heap allocations
             let apass_ptr = apass_ptr_uint as *mut Complex32;
             let bpass_ptr = bpass_ptr_uint as *mut Complex32;
             let shift = itarget.0 * pre.area;
@@ -182,8 +182,9 @@ impl Mosse {
             fft2d(&mut target, &pre, false);
 
             for n in 0..pre.area {
-                *apass_ptr.add(shift + n) = pre.gaussian[n] * target[n].conj(/**/);
-                *bpass_ptr.add(shift + n) = target[n] * target[n].conj(/**/);
+                let conjugate = target[n].conj(/**/);
+                *apass_ptr.add(shift + n) = pre.gaussian[n] * conjugate;
+                *bpass_ptr.add(shift + n) = target[n] * conjugate;
             }
         });
 
@@ -232,7 +233,7 @@ impl Mosse {
 
         for (i, c) in self.alloc_resp.iter(/**/).enumerate(/**/) {
             // Compute peak-to-sidelobe ratio in space domain
-            sumsq += c.re * c.re;
+            sumsq += c.re.powi(2);
             sum += c.re;
 
             if c.re > maxv {
@@ -242,9 +243,10 @@ impl Mosse {
         }
 
         let mean = sum / self.pre.area as f32;
-        let var = sumsq / self.pre.area as f32 - mean * mean;
-        if (maxv - mean) / var.sqrt(/**/).max(EPS) < conf.min_psr {
-            return None;
+        let var = sumsq / self.pre.area as f32 - mean.powi(2);
+        let peak_to_sidelobe_ratio = (maxv - mean) / var.sqrt(/**/);
+        if peak_to_sidelobe_ratio.max(EPS) < conf.min_psr {
+            return None
         }
     
         let row = (idx / self.pre.size) as isize;
@@ -286,13 +288,15 @@ impl Mosse {
         let next = self.extract_fft(giw);
 
         for i in 0..self.pre.area {
-            let an = self.pre.gaussian[i] * next[i].conj(/**/) * conf.learn_rate;
-            let bn = next[i] * next[i].conj(/**/) * conf.learn_rate;
+            let conjugate = next[i].conj(/**/) * conf.learn_rate;
+            let an = self.pre.gaussian[i] * conjugate;
+            let bn = next[i] * conjugate;
+
             self.a[i] = self.a[i] * (1f32 - conf.learn_rate) + an;
             self.b[i] = self.b[i] * (1f32 - conf.learn_rate) + bn;
             self.h[i] = self.a[i] / (self.b[i] + EPSCPX);
         }
-        
+
         Some(self)
     }
 
@@ -318,7 +322,7 @@ impl MultiMosse {
     fn init(&mut self, giw: GrayImageWrap, conf: &Config, detections: &[PyAbsBox], cache: &mut Cache) {
         // There exists some detector which periodically gives us a list of bounding boxes
         // Our job is to track underlying objects for as long as possible until next list
-        let mut replacement: Vec<Mosse> = Vec::with_capacity(self.max_targets);
+        let mut replacement = Vec::with_capacity(self.max_targets);
         let can_take_old = self.max_targets - detections.len(/**/);
 
         for &bbox in detections {
