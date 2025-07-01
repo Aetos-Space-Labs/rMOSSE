@@ -321,7 +321,7 @@ struct MultiMosse {
 impl MultiMosse {
     fn init(&mut self, giw: GrayImageWrap, conf: &Config, detections: &[PyAbsBox], cache: &mut Cache) {
         // There exists some detector which periodically gives us a list of bounding boxes
-        // Our job is to track underlying objects for as long as possible until next list
+        // Our job is to maintain temporal identities for long as possible until next list
         let mut replacement = Vec::with_capacity(self.max_targets);
         let can_take_old = self.max_targets - detections.len(/**/);
 
