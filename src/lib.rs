@@ -60,7 +60,7 @@ struct Precomputed {
 impl Precomputed {
     fn new(planner: &mut FftPlanner<f32>, size: usize) -> Arc<Self> {
         let nm = (size - 1) as f32;
-        let area = size * size;
+        let area = size.pow(2);
         let cx = nm / 2f32;
         let cy = nm / 2f32;
         
@@ -93,10 +93,114 @@ impl Precomputed {
         let peak_value = gaussian.iter(/**/).cloned(/**/).fold(0f32, f32::max);
         let to_pseudo_complex = |value: &f32| Complex32::new(value / peak_value, 0f32);
         let mut gaussian: VecCpxF32 = gaussian.iter(/**/).map(to_pseudo_complex).collect(/**/);
-        fft2dd(&mut gaussian, &fft, 1f32, size);
 
+        fft2dd(&mut gaussian, &fft, 1f32, size);
         let me = Self { fft, ifft, gaussian, hann, size, area, cx };
         Arc::new(me)
+    }
+
+    #[inline]
+    fn preprocess(&self, buf: &mut [f32], out: &mut [Complex32], base: f32) {
+        // Log-normalize and apply Hann window
+        let len = buf.len(/**/);
+        let mut sum = base;
+        let mut sq = base;
+
+        for value in buf.iter_mut(/**/) {
+            *value = value.ln(/**/);
+            sq += value.powi(2);
+            sum += *value;
+        }
+
+        let mean = sum / len as f32;
+        let variance = sq / len as f32 - mean.powi(2);
+        let std = variance.sqrt(/**/) + EPS;
+
+        for i in 0..len {
+            let norm_hann = (buf[i] - mean) / std * self.hann[i];
+            out[i] = Complex32::new(norm_hann, base);
+        }
+    }
+
+    #[inline]
+    fn crop(&self, giw: &GrayImageWrap, out: &mut [f32], cx: f32, cy: f32) {
+        // Bilinear interpolation + mirror-border reflection for out-of-border regions
+        // This method expects an image center and then computes its top/left point
+        let center_to_left_top = (self.size as f32 - 1f32) / 2f32;
+
+        out.chunks_mut(self.size).enumerate(/**/).for_each(|row| {
+            let yf = cy + (row.0 as f32 - center_to_left_top);
+            let y0 = yf.floor(/**/) as isize;
+            let dy = yf - y0 as f32;
+            let wy0 = 1f32 - dy;
+
+            let y00 = reflect(y0, giw.height);
+            let y01 = reflect(y0 + 1, giw.height);
+            
+            for (j, cell) in row.1.iter_mut(/**/).enumerate(/**/) {
+                let xf = cx + (j as f32 - center_to_left_top);
+                let x0 = xf.floor(/**/) as isize;
+                let dx = xf - x0 as f32;
+                let wx0 = 1f32 - dx;
+                
+                let x00 = reflect(x0, giw.width);
+                let x10 = reflect(x0 + 1, giw.width);
+
+                let i00 = giw.image.get_pixel(x00 as u32, y00 as u32)[0] as f32 + 1f32;
+                let i10 = giw.image.get_pixel(x10 as u32, y00 as u32)[0] as f32 + 1f32;
+                let i01 = giw.image.get_pixel(x00 as u32, y01 as u32)[0] as f32 + 1f32;
+                let i11 = giw.image.get_pixel(x10 as u32, y01 as u32)[0] as f32 + 1f32;
+                *cell = i00 * wx0 * wy0 + i10 * dx * wy0 + i01 * wx0 * dy + i11 * dx * dy;
+            }
+        });
+    }
+
+    #[inline]
+    fn warp(&self, src: &[f32], target: &mut [f32], scale: f32, n: usize) {
+        // Applies random rotation + shear + scale to a given patch
+        let mut rng = rand::rng(/**/);
+        
+        let ang = rng.random_range(-scale..scale);
+        let c = ang.cos(/**/);
+        let s = ang.sin(/**/);
+
+        let w00 = c + rng.random_range(-scale..scale);
+        let w01 = -s + rng.random_range(-scale..scale);
+        let w10 = s + rng.random_range(-scale..scale);
+        let w11 = c + rng.random_range(-scale..scale);
+
+        let w02 = self.cx - (w00 * self.cx + w01 * self.cx);
+        let w12 = self.cx - (w10 * self.cx + w11 * self.cx);
+
+        for i in 0..n as isize {
+            for j in 0..n as isize {
+                let u = w00 * j as f32 + w01 * i as f32 + w02;
+                let v = w10 * j as f32 + w11 * i as f32 + w12;
+
+                // integer base + fraction
+                let x0 = u.floor(/**/) as isize;
+                let y0 = v.floor(/**/) as isize;
+                let dx = u - x0 as f32;
+                let dy = v - y0 as f32;
+
+                // reflect101 on four corners
+                let x00 = reflect(x0, n as isize) as usize;
+                let y00 = reflect(y0, n as isize) as usize;
+                let x10 = reflect(x0 + 1, n as isize) as usize;
+                let y01 = reflect(y0 + 1, n as isize) as usize;
+
+                let i00 = src[y00 * n + x00];
+                let i10 = src[y00 * n + x10];
+                let i01 = src[y01 * n + x00];
+                let i11 = src[y01 * n + x10];
+
+                // bilinear interpolate
+                let t0 = i00 * (1f32 - dx) + i10 * dx;
+                let t1 = i01 * (1f32 - dx) + i11 * dx;
+                let index = (i as usize) * n + (j as usize);
+                target[index] = t0 * (1f32 - dy) + t1 * dy;
+            }
+        };
     }
 }
 
@@ -130,7 +234,6 @@ impl Cache {
 
 //
 
-#[derive(Clone, Copy)]
 struct Config {
     min_psr: f32,
     learn_rate: f32,
@@ -162,65 +265,62 @@ impl Mosse {
         let (size, cx, cy) = square(bbox, conf);
         let pre = cache.get(size);
 
-        let mut apass = vec![Complex32::ZERO; WARPS * pre.area];
-        let mut bpass = vec![Complex32::ZERO; WARPS * pre.area];
-        let apass_ptr_uint = apass.as_mut_ptr(/**/) as usize;
-        let bpass_ptr_uint = bpass.as_mut_ptr(/**/) as usize;
-
-        let mut alloc_warp = vec![0f32; WARPS * pre.area];
+        let mut total_warps = vec![0f32; WARPS * pre.area];
         let mut alloc_patch = vec![0f32; pre.area];
-        crop(giw, &pre, &mut alloc_patch, cx, cy);
+        pre.crop(giw, &mut alloc_patch, cx, cy);
 
-        alloc_warp.par_chunks_mut(pre.area).enumerate(/**/).for_each(|itarget| unsafe {
-            // Use pointer arithmetic to avoid per-warp apass/bpass heap allocations
-            let apass_ptr = apass_ptr_uint as *mut Complex32;
-            let bpass_ptr = bpass_ptr_uint as *mut Complex32;
-            let shift = itarget.0 * pre.area;
+        let parts: Vec<(VecCpxF32, VecCpxF32, VecCpxF32)> = 
+            total_warps.par_chunks_mut(pre.area).map(|warp| {
+                let mut target = vec![Complex32::ZERO; pre.area];
+                pre.warp(&alloc_patch, warp, conf.warp_scale, size);
+                pre.preprocess(warp, &mut target, 0f32);
+                fft2d(&mut target, &pre, false);
 
-            warp(&alloc_patch, itarget.1, conf.warp_scale, &pre, size);
-            let mut target = preprocess(itarget.1, &pre.hann, 0f32);
-            fft2d(&mut target, &pre, false);
+                let mut apass = Vec::with_capacity(pre.area);
+                let mut bpass = Vec::with_capacity(pre.area);
 
-            for n in 0..pre.area {
-                let conjugate = target[n].conj(/**/);
-                *apass_ptr.add(shift + n) = pre.gaussian[n] * conjugate;
-                *bpass_ptr.add(shift + n) = target[n] * conjugate;
-            }
-        });
+                for idx in 0..pre.area {
+                    let conjugate = target[idx].conj(/**/);
+                    apass.push(pre.gaussian[idx] * conjugate);
+                    bpass.push(target[idx] * conjugate);
+                }
 
-        let mut a = vec![Complex32::ZERO; pre.area];
-        let mut b = vec![Complex32::ZERO; pre.area];
-        let mut h = vec![Complex32::ZERO; pre.area];
+                (apass, bpass, target)
+            }).collect(/**/);
 
-        for n in 0..pre.area {
+        let mut a = Vec::with_capacity(pre.area);
+        let mut b = Vec::with_capacity(pre.area);
+        let mut h = Vec::with_capacity(pre.area);
+
+        for i in 0..pre.area {
             let mut asum = Complex32::ZERO;
             let mut bsum = Complex32::ZERO;
 
-            for idx in 0..WARPS {
-                let shift = idx * pre.area;
-                asum += apass[shift + n];
-                bsum += bpass[shift + n];
+            for (ai, bi, _) in &parts {
+                asum += ai[i];
+                bsum += bi[i];
             }
 
-            a[n] = asum;
-            b[n] = bsum;
+            a.push(asum);
+            b.push(bsum);
             bsum += EPSCPX;
-            h[n] = asum / bsum;
+            h.push(asum / bsum);
         }
 
         let alloc_resp = vec![Complex32::ZERO; pre.area];
-        Self { tracks, detects, pre, alloc_resp, alloc_patch, 
+        Self { tracks, detects, pre, alloc_patch, alloc_resp, 
             bbox, h, a, b, mac, cx, cy, id }
     }
 
     #[inline]
     fn update_consume(mut self, giw: &GrayImageWrap, conf: &Config) -> Option<Self> {
         // FFT cropped patch into frequency domain to avoid convolution
-        let current = self.extract_fft(giw);
+        let mut freq_domain = vec![Complex32::ZERO; self.pre.area];
+        self.extract_fft(&mut freq_domain, giw);
     
         for i in 0..self.pre.area {
             // collect fast filter response in frequency domain
-            self.alloc_resp[i] = current[i] * self.h[i];
+            self.alloc_resp[i] = freq_domain[i] * self.h[i];
         }
 
         // IFFT collected response back into space domain
@@ -233,6 +333,7 @@ impl Mosse {
 
         for (i, c) in self.alloc_resp.iter(/**/).enumerate(/**/) {
             // Compute peak-to-sidelobe ratio in space domain
+            // Peak is single pixel with max filter response
             sumsq += c.re.powi(2);
             sum += c.re;
 
@@ -244,25 +345,27 @@ impl Mosse {
 
         let mean = sum / self.pre.area as f32;
         let var = sumsq / self.pre.area as f32 - mean.powi(2);
-        let peak_to_sidelobe_ratio = (maxv - mean) / var.sqrt(/**/);
-        if peak_to_sidelobe_ratio.max(EPS) < conf.min_psr {
+        let psr = (maxv - mean) / var.max(EPS).sqrt(/**/);
+
+        if psr.max(EPS) < conf.min_psr {
             return None
         }
     
-        let row = (idx / self.pre.size) as isize;
-        let col = (idx % self.pre.size) as isize;
+        let peak_row = idx / self.pre.size;
+        let peak_col = idx % self.pre.size;
 
-        let resp_at = |r: isize, c: isize| -> f32 {
-            let r = r.clamp(0, self.pre.size as isize - 1) as usize;
-            let c = c.clamp(0, self.pre.size as isize - 1) as usize;
-            self.alloc_resp[r * self.pre.size + c].re
+        let resp_at = |r: usize, c: usize| -> f32 {
+            let r = r.clamp(0, self.pre.size - 1);
+            let c = c.clamp(0, self.pre.size - 1);
+            let location = r * self.pre.size + c;
+            self.alloc_resp[location].re
         };
 
-        let c_val = resp_at(row, col);
-        let l_val = resp_at(row, col - 1);
-        let r_val = resp_at(row, col + 1);
-        let t_val = resp_at(row - 1, col);
-        let b_val = resp_at(row + 1, col);
+        let c_val = resp_at(peak_row, peak_col);
+        let l_val = resp_at(peak_row, peak_col - 1);
+        let r_val = resp_at(peak_row, peak_col + 1);
+        let t_val = resp_at(peak_row - 1, peak_col);
+        let b_val = resp_at(peak_row + 1, peak_col);
 
         let denom_x = 2f32 * c_val - l_val - r_val;
         let denom_y = 2f32 * c_val - t_val - b_val;
@@ -276,8 +379,8 @@ impl Mosse {
         };
 
         let offset = (self.pre.size as f32 - 1f32) / 2f32;
-        let dx_shift = col as f32 + dx - offset;
-        let dy_shift = row as f32 + dy - offset;
+        let dx_shift = peak_col as f32 + dx - offset;
+        let dy_shift = peak_row as f32 + dy - offset;
 
         self.bbox[0] += dx_shift;
         self.bbox[1] += dy_shift;
@@ -285,15 +388,14 @@ impl Mosse {
         self.cy += dy_shift;
         self.tracks += 1f32;
 
-        let next = self.extract_fft(giw);
+        // Call it again because cx/cy has moved
+        self.extract_fft(&mut freq_domain, giw);
 
         for i in 0..self.pre.area {
-            let conjugate = next[i].conj(/**/) * conf.learn_rate;
-            let an = self.pre.gaussian[i] * conjugate;
-            let bn = next[i] * conjugate;
-
-            self.a[i] = self.a[i] * (1f32 - conf.learn_rate) + an;
-            self.b[i] = self.b[i] * (1f32 - conf.learn_rate) + bn;
+            let lr = 1f32 - conf.learn_rate;
+            let conjugate = freq_domain[i].conj(/**/) * conf.learn_rate;
+            self.a[i] = self.a[i] * lr + self.pre.gaussian[i] * conjugate;
+            self.b[i] = self.b[i] * lr + freq_domain[i] * conjugate;
             self.h[i] = self.a[i] / (self.b[i] + EPSCPX);
         }
 
@@ -301,11 +403,10 @@ impl Mosse {
     }
 
     #[inline]
-    fn extract_fft(&mut self, giw: &GrayImageWrap) -> VecCpxF32 {
-        crop(giw, &self.pre, &mut self.alloc_patch, self.cx, self.cy);
-        let mut buf = preprocess(&mut self.alloc_patch, &self.pre.hann, 0f32);
-        fft2d(&mut buf, &self.pre, false);
-        buf
+    fn extract_fft(&mut self, out: &mut [Complex32], giw: &GrayImageWrap) {
+        self.pre.crop(giw, &mut self.alloc_patch, self.cx, self.cy);
+        self.pre.preprocess(&mut self.alloc_patch, out, 0f32);
+        fft2d(out, &self.pre, false);
     }
 }
 
@@ -321,7 +422,7 @@ struct MultiMosse {
 impl MultiMosse {
     fn init(&mut self, giw: GrayImageWrap, conf: &Config, detections: &[PyAbsBox], cache: &mut Cache) {
         // There exists some detector which periodically gives us a list of bounding boxes
-        // Our job is to maintain temporal identities for long as possible until next list
+        // Our job is to track underlying objects for as long as possible until next list
         let mut replacement = Vec::with_capacity(self.max_targets);
         let can_take_old = self.max_targets - detections.len(/**/);
 
@@ -413,120 +514,13 @@ fn fft2dd(buf: &mut [Complex32], fourier: &Arc<FftF32>, scale: f32, n: usize) {
 }
 
 #[inline]
-fn crop(giw: &GrayImageWrap, pre: &Precomputed, out: &mut [f32], cx: f32, cy: f32) {
-    // Bilinear interpolation + mirror-border reflection for out-of-border regions
-    // This method expects an image center and then computes its top/left point
-    let center_to_left_top = (pre.size as f32 - 1f32) / 2f32;
-
-    out.chunks_mut(pre.size).enumerate(/**/).for_each(|row| {
-        let yf = cy + (row.0 as f32 - center_to_left_top);
-        let y0 = yf.floor(/**/) as isize;
-        let dy = yf - y0 as f32;
-        let wy0 = 1f32 - dy;
-
-        let y00 = reflect(y0, giw.height);
-        let y01 = reflect(y0 + 1, giw.height);
-        
-        for (j, cell) in row.1.iter_mut(/**/).enumerate(/**/) {
-            let xf = cx + (j as f32 - center_to_left_top);
-            let x0 = xf.floor(/**/) as isize;
-            let dx = xf - x0 as f32;
-            let wx0 = 1f32 - dx;
-            
-            let x00 = reflect(x0, giw.width);
-            let x10 = reflect(x0 + 1, giw.width);
-
-            let i00 = giw.image.get_pixel(x00 as u32, y00 as u32)[0] as f32 + 1f32;
-            let i10 = giw.image.get_pixel(x10 as u32, y00 as u32)[0] as f32 + 1f32;
-            let i01 = giw.image.get_pixel(x00 as u32, y01 as u32)[0] as f32 + 1f32;
-            let i11 = giw.image.get_pixel(x10 as u32, y01 as u32)[0] as f32 + 1f32;
-            *cell = i00 * wx0 * wy0 + i10 * dx * wy0 + i01 * wx0 * dy + i11 * dx * dy;
-        }
-    });
-}
-
-#[inline]
-fn preprocess(buf: &mut [f32], hann: &[f32], def: f32) -> VecCpxF32 {
-    let len = buf.len(/**/) as f32;
-    let mut sum = def;
-    let mut sq = def;
-
-    for value in buf.iter_mut(/**/) {
-        *value = value.ln(/**/);
-        sq += *value * *value;
-        sum += *value;
-    }
-
-    let mean = sum / len;
-    let var = sq / len - mean * mean;
-    let std = var.sqrt(/**/) + EPS;
-
-    let buf_iter = buf.iter(/**/);
-    let hann_iter = hann.iter(/**/);
-
-    buf_iter.zip(hann_iter).map(|(v, &w)| {
-        // Log-normalize and apply Hann window
-        let norm_hann = (*v - mean) / std * w;
-        Complex32::new(norm_hann, def)
-    }).collect(/**/)
-}
-
-#[inline]
-fn warp(src: &[f32], target: &mut [f32], scale: f32, pre: &Precomputed, n: usize) {
-    // Applies random rotation + shear + scale to a given patch
-    let mut rng = rand::rng(/**/);
-    
-    let ang = rng.random_range(-scale..scale);
-    let c = ang.cos(/**/);
-    let s = ang.sin(/**/);
-
-    let w00 = c + rng.random_range(-scale..scale);
-    let w01 = -s + rng.random_range(-scale..scale);
-    let w10 = s + rng.random_range(-scale..scale);
-    let w11 = c + rng.random_range(-scale..scale);
-
-    let w02 = pre.cx - (w00 * pre.cx + w01 * pre.cx);
-    let w12 = pre.cx - (w10 * pre.cx + w11 * pre.cx);
-
-    for i in 0..n as isize {
-        for j in 0..n as isize {
-            let u = w00 * j as f32 + w01 * i as f32 + w02;
-            let v = w10 * j as f32 + w11 * i as f32 + w12;
-
-            // integer base + fraction
-            let x0 = u.floor(/**/) as isize;
-            let y0 = v.floor(/**/) as isize;
-            let dx = u - x0 as f32;
-            let dy = v - y0 as f32;
-
-            // reflect101 on four corners
-            let x00 = reflect(x0, n as isize) as usize;
-            let y00 = reflect(y0, n as isize) as usize;
-            let x10 = reflect(x0 + 1, n as isize) as usize;
-            let y01 = reflect(y0 + 1, n as isize) as usize;
-
-            let i00 = src[y00 * n + x00];
-            let i10 = src[y00 * n + x10];
-            let i01 = src[y01 * n + x00];
-            let i11 = src[y01 * n + x10];
-
-            // bilinear interpolate
-            let t0 = i00 * (1f32 - dx) + i10 * dx;
-            let t1 = i01 * (1f32 - dx) + i11 * dx;
-            let index = (i as usize) * n + (j as usize);
-            target[index] = t0 * (1f32 - dy) + t1 * dy;
-        }
-    };
-}
-
-#[inline]
 fn reflect(idx: isize, len: isize) -> usize {
     // Mirror‐border reflect with 101 behavior
     let mut result = idx;
 
     while result < 0 || result >= len {
-        if result < 0 { result = -result; } 
-        else { result = 2 * len - 2 - result; }
+        if result < 0 { result = -result } 
+        else { result = 2 * len - 2 - result }
     }
     
     result as usize
