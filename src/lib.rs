@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 mod optimal_dft;
 use rayon::prelude::*;
 use rustfft::num_complex::Complex32;
@@ -39,7 +37,7 @@ impl GrayImageWrap {
         let h = shape[0] as u32;
         let w = shape[1] as u32;
         
-        let buffer: Vec<u8> = array.iter(/**/).cloned(/**/).collect(/**/);
+        let buffer = array.iter(/**/).cloned(/**/).collect(/**/);
         let image = image::GrayImage::from_raw(w, h, buffer).unwrap(/**/);
         Self { image, height: h as isize, width: w as isize }
     }
@@ -62,7 +60,6 @@ impl Precomputed {
         let nm = (size - 1) as f32;
         let area = size.pow(2);
         let cx = nm / 2f32;
-        let cy = nm / 2f32;
         
         // Hann window tapering function
         // Combats Heisenberg uncertainty
@@ -79,7 +76,7 @@ impl Precomputed {
         for i in 0..size {
             // Optimization: compute both gaussian and hann here
             let wy = 1f32 - (pi2 * i as f32 / nm).cos(/**/);
-            let dy = i as f32 - cy;
+            let dy = i as f32 - cx;
 
             for j in 0..size {
                 let dx = j as f32 - cx;
@@ -269,7 +266,7 @@ impl Mosse {
         let mut alloc_patch = vec![0f32; pre.area];
         pre.crop(giw, &mut alloc_patch, cx, cy);
 
-        let parts: Vec<(VecCpxF32, VecCpxF32, VecCpxF32)> = 
+        let parts: Vec<(VecCpxF32, VecCpxF32)> = 
             total_warps.par_chunks_mut(pre.area).map(|warp| {
                 let mut target = vec![Complex32::ZERO; pre.area];
                 pre.warp(&alloc_patch, warp, conf.warp_scale, size);
@@ -285,7 +282,7 @@ impl Mosse {
                     bpass.push(target[idx] * conjugate);
                 }
 
-                (apass, bpass, target)
+                (apass, bpass)
             }).collect(/**/);
 
         let mut a = Vec::with_capacity(pre.area);
@@ -296,7 +293,7 @@ impl Mosse {
             let mut asum = Complex32::ZERO;
             let mut bsum = Complex32::ZERO;
 
-            for (ai, bi, _) in &parts {
+            for (ai, bi) in &parts {
                 asum += ai[i];
                 bsum += bi[i];
             }
@@ -488,27 +485,27 @@ fn fft2d(buf: &mut [Complex32], pre: &Precomputed, ifft: bool) {
 #[inline]
 fn fft2dd(buf: &mut [Complex32], fourier: &Arc<FftF32>, scale: f32, n: usize) {
     // Applies 2D (row-wise, then column-wise) FFT/IFFT, avoids full transpose
-    buf.par_chunks_mut(n).for_each(|row| fourier.process(row));
-    let ptr_addr = buf.as_mut_ptr(/**/) as usize;
+    buf.par_chunks_mut(n).for_each(|row| {
+        fourier.process(row);
+    });
 
-    (0..n).into_par_iter(/**/).for_each(|column| {
+    let ptr_addr = buf.as_mut_ptr(/**/) as usize;
+    (0..n).into_par_iter(/**/).for_each(|column| unsafe {
         let ptr = ptr_addr as *mut Complex32;
         let mut col = Vec::with_capacity(n);
         
-        unsafe {
-            for i in 0..n {
-                let index = i * n + column;
-                let val = ptr.add(index);
-                col.push(*val);
-            }
+        for i in 0..n {
+            let index = i * n + column;
+            let val = ptr.add(index);
+            col.push(*val);
+        }
 
-            fourier.process(&mut col);
+        fourier.process(&mut col);
 
-            for i in 0..n {
-                let index = i * n + column;
-                let val = col[i] * scale;
-                *ptr.add(index) = val;
-            }
+        for i in 0..n {
+            let index = i * n + column;
+            let val = col[i] * scale;
+            *ptr.add(index) = val;
         }
     })
 }
@@ -584,8 +581,8 @@ impl PyMosse {
 
     #[new]
     fn new(max_targets: usize, threshold: f32, min_psr: f32, learn_rate: f32, warp_scale: f32, max_square: usize) -> Self {
-        let mm = MultiMosse { trackers: Vec::new(/**/), max_targets, threshold2: threshold * threshold, next_id: 0 };
         let conf = Config { min_psr, learn_rate, warp_scale, mov_avg_alpha: 0.2, mov_avg_decay: 0.995, max_square };
+        let mm = MultiMosse { trackers: Vec::new(/**/), max_targets, threshold2: threshold.powi(2), next_id: 0 };
         let cache = Cache::new(optimal_dft::LEN);
         Self { mm, cache, conf }
     }
