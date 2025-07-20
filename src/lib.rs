@@ -538,11 +538,7 @@ fn square(bbox: PyAbsBox, conf: &Config) -> (usize, f32, f32) {
 
 #[pyclass]
 struct PyTrack {
-    #[pyo3(get)] left: i32,
-    #[pyo3(get)] top: i32,
-    #[pyo3(get)] width: i32,
-    #[pyo3(get)] height: i32,
-    #[pyo3(get)] prob: i32,
+    #[pyo3(get)] bbox: PyAbsBox,
     #[pyo3(get)] trcs: i32,
     #[pyo3(get)] dts: i32,
     #[pyo3(get)] mac: i32,
@@ -552,11 +548,7 @@ struct PyTrack {
 #[inline]
 fn to_py_track(mosse: &Mosse) -> PyTrack {
     PyTrack { 
-        left: mosse.bbox[0] as i32, 
-        top: mosse.bbox[1] as i32,
-        width: mosse.bbox[2] as i32, 
-        height: mosse.bbox[3] as i32, 
-        prob: mosse.bbox[4] as i32, 
+        bbox: mosse.bbox,
         trcs: mosse.tracks as i32, 
         dts: mosse.detects as i32, 
         mac: mosse.mac as i32, 
@@ -583,8 +575,7 @@ impl PyMosse {
     fn new(max_targets: usize, threshold: f32, min_psr: f32, learn_rate: f32, warp_scale: f32, max_square: usize) -> Self {
         let conf = Config { min_psr, learn_rate, warp_scale, mov_avg_alpha: 0.2, mov_avg_decay: 0.995, max_square };
         let mm = MultiMosse { trackers: Vec::new(/**/), max_targets, threshold2: threshold.powi(2), next_id: 0 };
-        let cache = Cache::new(optimal_dft::LEN);
-        Self { mm, cache, conf }
+        Self { mm, cache: Cache::new(optimal_dft::LEN), conf }
     }
 }
 
