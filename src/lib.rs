@@ -3,6 +3,7 @@ use rayon::prelude::*;
 use rustfft::num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 use std::cmp::Ordering::Equal;
+use std::f32::consts::TAU;
 use std::sync::Arc;
 use rand::Rng;
 
@@ -17,7 +18,7 @@ type FftF32 = dyn Fft<f32>;
 type Unit = ();
 const UNIT: Unit = ();
 const EPS: f32 = 0.00001;
-const WARPS: usize = 8;
+const WARPS: usize = 6;
 
 const EPSCPX: Complex32 = 
     Complex32::new(EPS, 0f32);
@@ -70,18 +71,17 @@ impl Precomputed {
         let mut gaussian = Vec::with_capacity(area);
         let ifft = planner.plan_fft_inverse(size);
         let fft = planner.plan_fft_forward(size);
-        let pi2 = 2f32 * std::f32::consts::PI;
-        let sigma22 = 2f32 * 2f32 * 2f32;
+        let sigma22 = 2f32.powi(3);
 
         for i in 0..size {
             // Optimization: compute both gaussian and hann here
-            let wy = 1f32 - (pi2 * i as f32 / nm).cos(/**/);
+            let wy = 1f32 - (TAU * i as f32 / nm).cos(/**/);
             let dy = i as f32 - cx;
 
             for j in 0..size {
                 let dx = j as f32 - cx;
                 let val = (-(dx * dx + dy * dy) / sigma22).exp(/**/);
-                let wx = 1f32 - (pi2 * j as f32 / nm).cos(/**/);
+                let wx = 1f32 - (TAU * j as f32 / nm).cos(/**/);
                 hann.push(wy * wx / 4f32);
                 gaussian.push(val);
             }
@@ -197,7 +197,7 @@ impl Precomputed {
                 let index = (i as usize) * n + (j as usize);
                 target[index] = t0 * (1f32 - dy) + t1 * dy;
             }
-        };
+        }
     }
 }
 
@@ -210,9 +210,8 @@ struct Cache {
 
 impl Cache {
     fn new(len: usize) -> Self {
-        let planner = FftPlanner::new(/**/);
         let cache = Vec::with_capacity(len);
-        Self { planner, cache }
+        Self { planner: FftPlanner::new(/**/), cache }
     }
 
     fn get(&mut self, size: usize) -> Arc<Precomputed> {
@@ -232,12 +231,12 @@ impl Cache {
 //
 
 struct Config {
-    min_psr: f32,
-    learn_rate: f32,
-    warp_scale: f32,
     mov_avg_alpha: f32,
     mov_avg_decay: f32,
     max_square: usize,
+    warp_scale: f32,
+    learn_rate: f32,
+    min_psr: f32,
 }
 
 struct Mosse {
@@ -483,27 +482,27 @@ fn fft2d(buf: &mut [Complex32], pre: &Precomputed, ifft: bool) {
 }
 
 #[inline]
-fn fft2dd(buf: &mut [Complex32], fourier: &Arc<FftF32>, scale: f32, n: usize) {
+fn fft2dd(buf: &mut [Complex32], fourier: &Arc<FftF32>, scale: f32, size: usize) {
     // Applies 2D (row-wise, then column-wise) FFT/IFFT, avoids full transpose
-    buf.par_chunks_mut(n).for_each(|row| {
+    buf.par_chunks_mut(size).for_each(|row| {
         fourier.process(row);
     });
 
     let ptr_addr = buf.as_mut_ptr(/**/) as usize;
-    (0..n).into_par_iter(/**/).for_each(|column| unsafe {
+    (0..size).into_par_iter(/**/).for_each(|column| unsafe {
+        let mut col = Vec::with_capacity(size);
         let ptr = ptr_addr as *mut Complex32;
-        let mut col = Vec::with_capacity(n);
         
-        for i in 0..n {
-            let index = i * n + column;
+        for i in 0..size {
+            let index = i * size + column;
             let val = ptr.add(index);
             col.push(*val);
         }
 
         fourier.process(&mut col);
 
-        for i in 0..n {
-            let index = i * n + column;
+        for i in 0..size {
+            let index = i * size + column;
             let val = col[i] * scale;
             *ptr.add(index) = val;
         }
@@ -526,12 +525,10 @@ fn reflect(idx: isize, len: isize) -> usize {
 #[inline]
 fn square(bbox: PyAbsBox, conf: &Config) -> (usize, f32, f32) {
     let [left, top, width, height, _] = bbox;
-    let natural = width.max(height) as usize;
-    let size = natural.min(conf.max_square);
-    let size = optimal_dft::get_size(size);
-    let cx = left + width / 2f32;
-    let cy = top + height / 2f32;
-    (size, cx, cy)
+
+    let natural = width.max(height).ceil(/**/) as usize;
+    let clamped = natural.clamp(optimal_dft::MIN, conf.max_square);
+    (optimal_dft::get_size(clamped), left + width / 2f32, top + height / 2f32)
 }
 
 // PYTHON
@@ -573,7 +570,7 @@ impl PyMosse {
 
     #[new]
     fn new(max_targets: usize, threshold: f32, min_psr: f32, learn_rate: f32, warp_scale: f32, max_square: usize) -> Self {
-        let conf = Config { min_psr, learn_rate, warp_scale, mov_avg_alpha: 0.2, mov_avg_decay: 0.995, max_square };
+        let conf = Config { mov_avg_alpha: 0.2, mov_avg_decay: 0.995, max_square, warp_scale, learn_rate, min_psr };
         let mm = MultiMosse { trackers: Vec::new(/**/), max_targets, threshold2: threshold.powi(2), next_id: 0 };
         Self { mm, cache: Cache::new(optimal_dft::LEN), conf }
     }
