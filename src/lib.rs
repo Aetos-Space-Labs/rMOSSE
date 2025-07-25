@@ -224,7 +224,8 @@ struct Mosse {
     tracks: f32,
     detects: f32,
     pre: Arc<Precomputed>,
-    alloc_patch: Vec<f32>,
+    alloc_patch_space: Vec<f32>,
+    alloc_patch_freq: VecCpxF32,
     alloc_resp: VecCpxF32,
     bbox: PyAbsBox,
     h: VecCpxF32,
@@ -243,23 +244,23 @@ impl Mosse {
         let pre = cache.get(size);
 
         let mut total_warps = vec![0f32; WARPS * pre.area];
-        let mut alloc_patch = vec![0f32; pre.area];
-        pre.crop(iw, &mut alloc_patch, cx, cy);
+        let mut alloc_patch_space = vec![0f32; pre.area];
+        pre.crop(iw, &mut alloc_patch_space, cx, cy);
 
         let parts: Vec<(VecCpxF32, VecCpxF32)> = 
             total_warps.par_chunks_mut(pre.area).map(|warp| {
-                let mut target = vec![Complex32::ZERO; pre.area];
-                pre.warp(&alloc_patch, warp, conf.warp_scale, size);
-                pre.preprocess(warp, &mut target, 0f32);
-                fft2d(&mut target, &pre, false);
+                let mut target_freq = vec![Complex32::ZERO; pre.area];
+                pre.warp(&alloc_patch_space, warp, conf.warp_scale, size);
+                pre.preprocess(warp, &mut target_freq, 0f32);
+                fft2d(&mut target_freq, &pre, false);
 
                 let mut apass = Vec::with_capacity(pre.area);
                 let mut bpass = Vec::with_capacity(pre.area);
 
                 for idx in 0..pre.area {
-                    let conjugate = target[idx].conj(/**/);
+                    let conjugate = target_freq[idx].conj(/**/);
                     apass.push(pre.gaussian[idx] * conjugate);
-                    bpass.push(target[idx] * conjugate);
+                    bpass.push(target_freq[idx] * conjugate);
                 }
 
                 (apass, bpass)
@@ -273,9 +274,9 @@ impl Mosse {
             let mut asum = Complex32::ZERO;
             let mut bsum = Complex32::ZERO;
 
-            for (ai, bi) in &parts {
-                asum += ai[i];
-                bsum += bi[i];
+            for (an, bn) in &parts {
+                asum += an[i];
+                bsum += bn[i];
             }
 
             a.push(asum);
@@ -285,19 +286,19 @@ impl Mosse {
         }
 
         let alloc_resp = vec![Complex32::ZERO; pre.area];
-        Self { tracks, detects, pre, alloc_patch, alloc_resp, 
-            bbox, h, a, b, mac, cx, cy, id }
+        let alloc_patch_freq = vec![Complex32::ZERO; pre.area];
+        Self { tracks, detects, pre, alloc_patch_space, alloc_patch_freq, 
+            alloc_resp, bbox, h, a, b, mac, cx, cy, id }
     }
 
     #[inline]
     fn update_consume(mut self, iw: &ImgView, conf: &Config) -> Option<Self> {
         // FFT cropped patch into frequency domain to avoid convolution
-        let mut freq_domain = vec![Complex32::ZERO; self.pre.area];
-        self.extract_fft(&mut freq_domain, iw);
+        self.extract_fft(iw);
     
         for i in 0..self.pre.area {
             // collect fast filter response in frequency domain
-            self.alloc_resp[i] = freq_domain[i] * self.h[i];
+            self.alloc_resp[i] = self.alloc_patch_freq[i] * self.h[i];
         }
 
         // IFFT collected response back into space domain
@@ -364,26 +365,30 @@ impl Mosse {
         self.cx += dx_shift;
         self.cy += dy_shift;
         self.tracks += 1f32;
-
-        // Call it again because cx/cy has moved
-        self.extract_fft(&mut freq_domain, iw);
-
-        for i in 0..self.pre.area {
-            let lr = 1f32 - conf.learn_rate;
-            let conjugate = freq_domain[i].conj(/**/) * conf.learn_rate;
-            self.a[i] = self.a[i] * lr + self.pre.gaussian[i] * conjugate;
-            self.b[i] = self.b[i] * lr + freq_domain[i] * conjugate;
-            self.h[i] = self.a[i] / (self.b[i] + EPSCPX);
-        }
-
         Some(self)
     }
 
     #[inline]
-    fn extract_fft(&mut self, out: &mut [Complex32], iw: &ImgView) {
-        self.pre.crop(iw, &mut self.alloc_patch, self.cx, self.cy);
-        self.pre.preprocess(&mut self.alloc_patch, out, 0f32);
-        fft2d(out, &self.pre, false);
+    fn learn(&mut self, iw: &ImgView, conf: &Config) {
+        // We explicitly separate learning phase from update phase here
+        // This way API user can obtain result faster and learn afterwards
+        self.extract_fft(iw);
+
+        for i in 0..self.pre.area {
+            let lr = 1f32 - conf.learn_rate;
+            let frequency_slot = self.alloc_patch_freq[i];
+            let conjugate = frequency_slot.conj(/**/) * conf.learn_rate;
+            self.a[i] = self.a[i] * lr + self.pre.gaussian[i] * conjugate;
+            self.b[i] = self.b[i] * lr + frequency_slot * conjugate;
+            self.h[i] = self.a[i] / (self.b[i] + EPSCPX);
+        }
+    }
+
+    #[inline]
+    fn extract_fft(&mut self, iw: &ImgView) {
+        self.pre.crop(iw, &mut self.alloc_patch_space, self.cx, self.cy);
+        self.pre.preprocess(&mut self.alloc_patch_space, &mut self.alloc_patch_freq, 0f32);
+        fft2d(&mut self.alloc_patch_freq, &self.pre, false);
     }
 }
 
@@ -547,6 +552,13 @@ impl PyMosse {
         self.mm.init(gray_image.as_array(/**/), &self.conf, &detections, &mut self.cache);
         let out = self.mm.trackers.iter(/**/).map(to_py_track).collect(/**/);
         Ok(out)
+    }
+
+    fn learn(&mut self, gray_image: PyReadonlyArray2<u8>) {
+        let gray_image_view = gray_image.as_array(/**/);
+        for tracker in self.mm.trackers.iter_mut(/**/) {
+            tracker.learn(&gray_image_view, &self.conf);
+        }
     }
 
     #[new]
