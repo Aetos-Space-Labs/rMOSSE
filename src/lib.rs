@@ -9,10 +9,12 @@ use rand::Rng;
 
 use pyo3::prelude::*;
 use numpy::PyReadonlyArray2;
+use numpy::ndarray::{ArrayView, Ix2};
 
 // [x, y, w, h, prob]
 type PyAbsBox = [f32; 5];
 type VecCpxF32 = Vec<Complex32>;
+type ImgView<'a> = ArrayView<'a, u8, Ix2>;
 type FftF32 = dyn Fft<f32>;
 
 type Unit = ();
@@ -22,29 +24,6 @@ const WARPS: usize = 6;
 
 const EPSCPX: Complex32 = 
     Complex32::new(EPS, 0f32);
-
-//
-
-struct GrayImageWrap {
-    image: image::GrayImage,
-    height: isize,
-    width: isize,
-}
-
-impl GrayImageWrap {
-    fn from_py(raw: PyReadonlyArray2<u8>) -> Self {
-        let array = raw.as_array(/**/);
-        let shape = array.shape(/**/);
-        let h = shape[0] as u32;
-        let w = shape[1] as u32;
-        
-        let buffer = array.iter(/**/).cloned(/**/).collect(/**/);
-        let image = image::GrayImage::from_raw(w, h, buffer).unwrap(/**/);
-        Self { image, height: h as isize, width: w as isize }
-    }
-}
-
-//
 
 struct Precomputed {
     fft: Arc<FftF32>,
@@ -120,10 +99,12 @@ impl Precomputed {
     }
 
     #[inline]
-    fn crop(&self, giw: &GrayImageWrap, out: &mut [f32], cx: f32, cy: f32) {
+    fn crop(&self, iw: &ImgView, out: &mut [f32], cx: f32, cy: f32) {
         // Bilinear interpolation + mirror-border reflection for out-of-border regions
         // This method expects an image center and then computes its top/left point
         let center_to_left_top = (self.size as f32 - 1f32) / 2f32;
+        let height = iw.nrows(/**/) as isize;
+        let width = iw.ncols(/**/) as isize;
 
         out.chunks_mut(self.size).enumerate(/**/).for_each(|row| {
             let yf = cy + (row.0 as f32 - center_to_left_top);
@@ -131,8 +112,8 @@ impl Precomputed {
             let dy = yf - y0 as f32;
             let wy0 = 1f32 - dy;
 
-            let y00 = reflect(y0, giw.height);
-            let y01 = reflect(y0 + 1, giw.height);
+            let y00 = reflect(y0, height);
+            let y01 = reflect(y0 + 1, height);
             
             for (j, cell) in row.1.iter_mut(/**/).enumerate(/**/) {
                 let xf = cx + (j as f32 - center_to_left_top);
@@ -140,13 +121,13 @@ impl Precomputed {
                 let dx = xf - x0 as f32;
                 let wx0 = 1f32 - dx;
                 
-                let x00 = reflect(x0, giw.width);
-                let x10 = reflect(x0 + 1, giw.width);
+                let x00 = reflect(x0, width);
+                let x10 = reflect(x0 + 1, width);
 
-                let i00 = giw.image.get_pixel(x00 as u32, y00 as u32)[0] as f32 + 1f32;
-                let i10 = giw.image.get_pixel(x10 as u32, y00 as u32)[0] as f32 + 1f32;
-                let i01 = giw.image.get_pixel(x00 as u32, y01 as u32)[0] as f32 + 1f32;
-                let i11 = giw.image.get_pixel(x10 as u32, y01 as u32)[0] as f32 + 1f32;
+                let i00 = iw[(y00, x00)] as f32 + 1f32;
+                let i10 = iw[(y00, x10)] as f32 + 1f32;
+                let i01 = iw[(y01, x00)] as f32 + 1f32;
+                let i11 = iw[(y01, x10)] as f32 + 1f32;
                 *cell = i00 * wx0 * wy0 + i10 * dx * wy0 + i01 * wx0 * dy + i11 * dx * dy;
             }
         });
@@ -256,14 +237,14 @@ struct Mosse {
 }
 
 impl Mosse {
-    fn new(mac: f32, tracks: f32, detects: f32, conf: &Config, cache: &mut Cache, giw: &GrayImageWrap, bbox: PyAbsBox, id: i32) -> Self {
+    fn new(mac: f32, tracks: f32, detects: f32, conf: &Config, cache: &mut Cache, iw: &ImgView, bbox: PyAbsBox, id: i32) -> Self {
         // Our cache won't grow too much since we adjust an actual bounding box size to discrete, small, finite set of optimal values
         let (size, cx, cy) = square(bbox, conf);
         let pre = cache.get(size);
 
         let mut total_warps = vec![0f32; WARPS * pre.area];
         let mut alloc_patch = vec![0f32; pre.area];
-        pre.crop(giw, &mut alloc_patch, cx, cy);
+        pre.crop(iw, &mut alloc_patch, cx, cy);
 
         let parts: Vec<(VecCpxF32, VecCpxF32)> = 
             total_warps.par_chunks_mut(pre.area).map(|warp| {
@@ -309,10 +290,10 @@ impl Mosse {
     }
 
     #[inline]
-    fn update_consume(mut self, giw: &GrayImageWrap, conf: &Config) -> Option<Self> {
+    fn update_consume(mut self, iw: &ImgView, conf: &Config) -> Option<Self> {
         // FFT cropped patch into frequency domain to avoid convolution
         let mut freq_domain = vec![Complex32::ZERO; self.pre.area];
-        self.extract_fft(&mut freq_domain, giw);
+        self.extract_fft(&mut freq_domain, iw);
     
         for i in 0..self.pre.area {
             // collect fast filter response in frequency domain
@@ -385,7 +366,7 @@ impl Mosse {
         self.tracks += 1f32;
 
         // Call it again because cx/cy has moved
-        self.extract_fft(&mut freq_domain, giw);
+        self.extract_fft(&mut freq_domain, iw);
 
         for i in 0..self.pre.area {
             let lr = 1f32 - conf.learn_rate;
@@ -399,8 +380,8 @@ impl Mosse {
     }
 
     #[inline]
-    fn extract_fft(&mut self, out: &mut [Complex32], giw: &GrayImageWrap) {
-        self.pre.crop(giw, &mut self.alloc_patch, self.cx, self.cy);
+    fn extract_fft(&mut self, out: &mut [Complex32], iw: &ImgView) {
+        self.pre.crop(iw, &mut self.alloc_patch, self.cx, self.cy);
         self.pre.preprocess(&mut self.alloc_patch, out, 0f32);
         fft2d(out, &self.pre, false);
     }
@@ -416,7 +397,7 @@ struct MultiMosse {
 }
 
 impl MultiMosse {
-    fn init(&mut self, giw: GrayImageWrap, conf: &Config, detections: &[PyAbsBox], cache: &mut Cache) {
+    fn init(&mut self, iw: ImgView, conf: &Config, detections: &[PyAbsBox], cache: &mut Cache) {
         // There exists some detector which periodically gives us a list of bounding boxes
         // Our job is to track underlying objects for as long as possible until next list
         let mut replacement = Vec::with_capacity(self.max_targets);
@@ -438,12 +419,12 @@ impl MultiMosse {
             if let Some(tuple) = best {
                 let Mosse { tracks, detects, mac, id, .. } = self.trackers.swap_remove(tuple.0);
                 let mov_avg_update = mac * (1.0 - conf.mov_avg_alpha) + bbox[4] * conf.mov_avg_alpha;
-                let m = Mosse::new(mov_avg_update, tracks, detects + 1f32, conf, cache, &giw, bbox, id);
+                let m = Mosse::new(mov_avg_update, tracks, detects + 1f32, conf, cache, &iw, bbox, id);
                 replacement.push(m);
             } else {
                 self.next_id += 1;
                 // Just spawn and add a new tracker for this brand new detection
-                let m = Mosse::new(bbox[4], 1f32, 1f32, conf, cache, &giw, bbox, self.next_id);
+                let m = Mosse::new(bbox[4], 1f32, 1f32, conf, cache, &iw, bbox, self.next_id);
                 replacement.push(m);
             }
         }
@@ -453,7 +434,7 @@ impl MultiMosse {
         self.trackers = self.trackers.drain(..).filter_map(|mut m| {
             // Gradually decrease moving average confidence
             m.mac *= conf.mov_avg_decay;
-            m.update_consume(&giw, conf)
+            m.update_consume(&iw, conf)
         }).collect(/**/);
 
         if can_take_old > 0 {
@@ -563,7 +544,7 @@ struct PyMosse {
 #[pymethods]
 impl PyMosse {
     fn init(&mut self, detections: Vec<PyAbsBox>, gray_image: PyReadonlyArray2<u8>) -> PyResult<Vec<PyTrack>> {
-        self.mm.init(GrayImageWrap::from_py(gray_image), &self.conf, &detections, &mut self.cache);
+        self.mm.init(gray_image.as_array(/**/), &self.conf, &detections, &mut self.cache);
         let out = self.mm.trackers.iter(/**/).map(to_py_track).collect(/**/);
         Ok(out)
     }
